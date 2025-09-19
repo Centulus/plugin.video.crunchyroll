@@ -436,8 +436,8 @@ class VideoPlayer(Object):
                 update_playhead(G.args.get_arg('episode_id'), int(current))
                 return
             
-            # Normal playback - update every 20 seconds
-            if (current - self.lastUpdatePlayhead) >= 20:
+            # Normal playback - update every 10 seconds
+            if (current - self.lastUpdatePlayhead) >= 10:
                 self.lastUpdatePlayhead = current
                 self.lastKnownTime = current
                 self.wasPlaying = True
@@ -567,6 +567,21 @@ def update_playhead(content_id: str, playhead: int):
     utils.crunchy_log(f"Sending playhead update: content_id={content_id}, playhead={playhead}", xbmc.LOGINFO)
 
     try:
+        # Proactively refresh token well before expiry (safety window)
+        try:
+            from .api import str_to_date, get_date
+            if getattr(G.api.account_data, 'expires', None):
+                now = get_date()
+                exp = str_to_date(G.api.account_data.expires)
+                remaining = (exp - now).total_seconds()
+                # Refresh if < 60 seconds remaining
+                if remaining < 60:
+                    utils.crunchy_log(
+                        f"Access token refresh preemptive (remaining ~{int(remaining)}s)", xbmc.LOGINFO
+                    )
+                    G.api.create_session(action="refresh")
+        except Exception:
+            pass
         # Ensure Cloudflare cookie present for www endpoint requests
         if not getattr(G.api, 'cf_cookie', None):
             try:
@@ -593,15 +608,23 @@ def update_playhead(content_id: str, playhead: int):
         
         utils.crunchy_log(f"POST {url} with payload {payload}", xbmc.LOGINFO)
         
-        r = scraper.post(
-            url,
-            json=payload,
-            headers=headers,
-            timeout=15
-        )
-        
+        r = scraper.post(url, json=payload, headers=headers, timeout=15)
         utils.crunchy_log(f"Playhead response: {r.status_code} - {r.text[:200]}", xbmc.LOGINFO)
-        
+
+        if r.status_code == 401:
+            # Refresh token and retry once
+            utils.crunchy_log("Playhead 401 - refreshing access token and retrying once", xbmc.LOGWARNING)
+            try:
+                G.api.create_session(action="refresh")
+                # Update headers with new token and cookie
+                headers['Authorization'] = f"Bearer {G.api.account_data.access_token}"
+                if getattr(G.api, 'cf_cookie', None):
+                    headers['Cookie'] = G.api.cf_cookie
+                r = scraper.post(url, json=payload, headers=headers, timeout=15)
+                utils.crunchy_log(f"Retry playhead response: {r.status_code} - {r.text[:200]}", xbmc.LOGINFO)
+            except Exception as e:
+                utils.crunchy_log(f"Token refresh failed during playhead retry: {e}", xbmc.LOGERROR)
+
         if not r.ok:
             raise CrunchyrollError(f"[{r.status_code}] {r.text[:200]}")
             

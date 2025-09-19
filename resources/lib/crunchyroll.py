@@ -45,9 +45,7 @@ def main(argv):
             xbmcaddon.Addon(id="inputstream.adaptive").openSettings()
         return True
 
-    # get account information
-    username = G.args.addon.getSetting("crunchyroll_username")
-    password = G.args.addon.getSetting("crunchyroll_password")
+    # remove legacy credential gating; we no longer use username/password
     G.args._device_id = G.args.addon.getSetting("device_id")
     if not G.args.device_id:
         char_set = "0123456789abcdefghijklmnopqrstuvwxyz0123456789"
@@ -76,35 +74,114 @@ def main(argv):
             10
         )
 
-    if not (username and password):
-        # open addon settings
-        view.add_item({"title": G.args.addon.getLocalizedString(30062)})
+    # login/session init
+    try:
+        G.api.start()
+        
+        if not G.api.account_data.access_token:
+            # Hybrid auth: try username/password first (mobile client), then fallback to device-code.
+            username = G.args.addon.getSetting("crunchyroll_username")
+            password = G.args.addon.getSetting("crunchyroll_password")
+
+            tried_password = False
+            if username and password:
+                try:
+                    utils.crunchy_log("Attempting username/password login (mobile client)")
+                    G.api.create_session(action="login")
+                    tried_password = True
+                except LoginError:
+                    utils.crunchy_log("Password login failed, will fallback to device-code")
+                except Exception as e:
+                    utils.crunchy_log(f"Unexpected error during password login: {e}")
+
+            if not G.api.account_data.access_token:
+                # begin device code flow (preferred when no creds or creds fail)
+                from .gui import ActivationDialog
+
+                # init cloudflare cookie and anonymous token for www.crunchyroll.com
+                G.api.init_cf_cookie()
+                G.api.acquire_anonymous_token()
+
+                # Clear/replace the current listing with an empty one before showing the modal dialog,
+                # so nothing remains visible behind the overlay.
+                try:
+                    view.end_of_directory(update_listing=True, cache_to_disc=False)
+                except Exception:
+                    pass
+
+                device = G.api.request_device_code()
+                if not device:
+                    raise LoginError("Failed to request device code")
+
+                user_code = device.get("user_code", "------").upper()
+                device_code = device.get("device_code")
+                interval_ms = int(device.get("interval", 500))  # milliseconds
+                expires_in = int(device.get("expires_in", 300))  # seconds
+
+                qr_url = f"https://crunchyroll.com/activate?code={user_code}&device=Android%20TV"
+                info_text = f"1. Go to https://crunchyroll.com/activate\n2. Enter code: {user_code}\n3. Or scan the QR code below"
+
+                dialog = ActivationDialog('plugin-video-crunchyroll-activation.xml', G.args.addon.getAddonInfo('path'), 'default', '1080i', 
+                                        code=user_code, qr_url=qr_url, info=info_text, 
+                                        expires_in=expires_in, interval_ms=interval_ms,
+                                        device_code=device_code, api_instance=G.api)
+                dialog.show()
+
+                import time as _t
+                start_ts = _t.time()
+                user_cancelled = False
+                try:
+                    while _t.time() - start_ts < expires_in:
+                        # Stop polling if user closed the dialog
+                        if hasattr(dialog, 'is_running') and not dialog.is_running:
+                            user_cancelled = True
+                            break
+
+                        # Use the current device_code from dialog (might be updated if regenerated)
+                        current_device_code = dialog.device_code if hasattr(dialog, 'device_code') else device_code
+                        token = G.api.poll_device_token(current_device_code)
+                        if token and token.get('access_token'):
+                            # finalize session then reload addon root to render fresh UI
+                            G.api._finalize_session_from_token_response(token)
+                            try:
+                                xbmc.executebuiltin(f"Container.Update({G.args.addonurl}, replace)")
+                            except Exception:
+                                pass
+                            return True
+                        # Use the dialog's current interval if it was regenerated, else fallback to the initial one
+                        sleep_ms = getattr(dialog, 'interval_ms', interval_ms)
+                        xbmc.sleep(max(1, int(sleep_ms)))
+                    else:
+                        # expired; close and inform
+                        xbmcgui.Dialog().notification(G.args.addon_name, 'Activation expired. Please try again.', xbmcgui.NOTIFICATION_INFO, 5)
+                finally:
+                    try:
+                        dialog.is_running = False  # Stop timer thread
+                        dialog.close()
+                    except Exception:
+                        pass
+
+                # If user cancelled, just exit cleanly; listing was already ended before dialog
+                if user_cancelled and not G.api.account_data.access_token:
+                    return False
+
+        # request to select profile if not set already
+        if G.api.profile_data.profile_id is None:
+            controller.show_profiles()
+
+        # If a previous step triggered a Container.Update (e.g., after profile selection),
+        # skip building any listing in this invocation to avoid spinner/race conditions.
+        if getattr(G.args, '_redirected', False):
+            return True
+
+        xbmcplugin.setContent(int(G.args.argv[1]), "tvshows")
+        return check_mode()
+    except (LoginError, CrunchyrollError):
+        utils.crunchy_log("Login failed", xbmc.LOGERROR)
+        view.add_item({"title": G.args.addon.getLocalizedString(30060)})
         view.end_of_directory()
-        G.args.addon.openSettings()
+        xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30060))
         return False
-    else:
-        # login
-        try:
-            G.api.start()
-
-            # request to select profile if not set already
-            if G.api.profile_data.profile_id is None:
-                controller.show_profiles()
-
-            # list menu
-            xbmcplugin.setContent(int(G.args.argv[1]), "tvshows")
-
-            return check_mode()
-        except (LoginError, CrunchyrollError):
-            # login failed
-            utils.crunchy_log("Login failed", xbmc.LOGERROR)
-            utils.crunchy_log("If you have not changed your Crunchyroll login credentials, please download the latest app version.", xbmc.LOGINFO)
-            utils.crunchy_log("If the problem persists, please open an issue on github.", xbmc.LOGINFO)
-            view.add_item({"title": G.args.addon.getLocalizedString(30060)})
-            view.end_of_directory()
-            xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30060))
-
-            return False
 
 
 def check_mode():

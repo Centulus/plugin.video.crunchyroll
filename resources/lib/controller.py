@@ -18,7 +18,6 @@
 
 import json
 import math
-import time
 
 import xbmc
 import xbmcgui
@@ -64,6 +63,12 @@ def show_profiles():
         return True
     else:
         G.api.create_session(action="refresh_profile", profile_id=profiles[selected].get("profile_id"))
+        try:
+            import xbmc
+            setattr(G.args, '_redirected', True)
+            xbmc.executebuiltin(f"Container.Update({G.args.addonurl}, replace)")
+        except Exception:
+            pass
         return True
 
 

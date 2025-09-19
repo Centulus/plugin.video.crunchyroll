@@ -27,7 +27,7 @@ from requests import HTTPError, Response
 
 from . import utils
 from .globals import G
-from .model import AccountData, LoginError, ProfileData
+from .model import AccountData, LoginError, ProfileData, CrunchyrollError
 from ..modules import cloudscraper
 
 
@@ -41,14 +41,25 @@ class API:
     # DEVICE = "com.crunchyroll.windows.desktop"
     # TIMEOUT = 30
 
-    CRUNCHYROLL_UA = "Crunchyroll/3.90.0 Android/14 okhttp/4.12.0"
+    # Dynamic client configuration loaded from latest.json
+    CRUNCHYROLL_UA = ""
+    UA_MOBILE = ""
+    UA_ATV = ""
 
+    # Authentication endpoints
     INDEX_ENDPOINT = "https://beta-api.crunchyroll.com/index/v2"
     PROFILE_ENDPOINT = "https://beta-api.crunchyroll.com/accounts/v1/me/profile"
-    TOKEN_ENDPOINT = "https://beta-api.crunchyroll.com/auth/v1/token"
+    TOKEN_ENDPOINT = "https://www.crunchyroll.com/auth/v1/token"
+    DEVICE_CODE_ENDPOINT = "https://www.crunchyroll.com/auth/v1/device/code"
+    DEVICE_TOKEN_ENDPOINT = "https://www.crunchyroll.com/auth/v1/device/token"
+    # Content and search endpoints
     SEARCH_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/search"
+    
+    # Playback endpoints
     STREAMS_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/videos/{}/streams"
-    STREAMS_ENDPOINT_DRM = "https://cr-play-service.prd.crunchyrollsvc.com/v1/{}/android/phone/play"
+    STREAMS_ENDPOINT_DRM = "https://www.crunchyroll.com/playback/v2/{}/tv/android_tv/play"
+    # Fallback legacy phone playback endpoint (kept for compatibility)
+    STREAMS_ENDPOINT_DRM_PHONE = "https://cr-play-service.prd.crunchyrollsvc.com/v1/{}/android/phone/play"
     STREAMS_ENDPOINT_CLEAR_STREAM = "https://cr-play-service.prd.crunchyrollsvc.com/v1/token/{}/{}"
     STREAMS_ENDPOINT_GET_ACTIVE_STREAMS = "https://cr-play-service.prd.crunchyrollsvc.com/playback/v1/sessions/streaming"
     # SERIES_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/series/{}"
@@ -75,7 +86,15 @@ class API:
     CRUNCHYLISTS_LISTS_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/custom-lists"
     CRUNCHYLISTS_VIEW_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/custom-lists/{}"
 
-    AUTHORIZATION = "Basic YmY3MHg2aWhjYzhoZ3p3c2J2eGk6eDJjc3BQZXQzWno1d0pDdEpyVUNPSVM5Ynpad1JDcGM="
+    # Dynamic client credentials (loaded from latest.json)
+    CLIENT_AUTH_B64 = ""
+    CLIENT_AUTH_B64_DEVICE = ""
+    CLIENT_AUTH_B64_MOBILE = ""
+    APP_VERSION = ""
+    APP_VERSION_ATV = ""
+    APP_VERSION_MOBILE = ""
+    
+    # DRM endpoints
     LICENSE_ENDPOINT = "https://cr-license-proxy.prd.crunchyrollsvc.com/v1/license/widevine"
 
     PROFILES_LIST_ENDPOINT = "https://beta-api.crunchyroll.com/accounts/v1/me/multiprofile"
@@ -92,6 +111,16 @@ class API:
         self.profile_data: ProfileData = ProfileData(dict())
         self.api_headers: Dict = default_request_headers()
         self.retry_counter = 0
+        self.etp_anonymous_id: str = ""
+        self.DEVICE_CLIENT_ID: str = ""
+        self.DEVICE_CLIENT_SECRET: str = ""
+        self.session_client: str = "unknown"  # 'device' or 'mobile'
+        self.cf_cookie: str = ""
+        # try to load dynamic client config
+        try:
+            self._load_client_config()
+        except Exception:
+            pass
 
     def start(self) -> None:
         session_restart = G.args.get_arg('session_restart', False)
@@ -114,17 +143,56 @@ class API:
                 return
 
         # session management
-        self.create_session(action="refresh" if session_restart else "access")
+        if session_restart:
+            try:
+                self.create_session(action="refresh")
+                # Check if refresh was successful
+                if not self.account_data.access_token:
+                    utils.crunchy_log("Refresh failed - access token is empty, will need device-code flow")
+                    return
+                utils.crunchy_log("Session refreshed successfully")
+            except (LoginError, CrunchyrollError) as e:
+                utils.crunchy_log(f"Session refresh failed: {e}, will need device-code flow")
+                # Clear any partial session data
+                self.account_data.delete_storage()
+                self.account_data = AccountData({})
+                return
+            except Exception as e:
+                utils.crunchy_log(f"Unexpected error during session refresh: {e}")
+                self.account_data.delete_storage()
+                self.account_data = AccountData({})
+                return
+        else:
+            # No session yet; caller will decide login method (user/pass or device-code)
+            return
 
-    def create_session(self, action: str = "login", profile_id: Optional[str] = None) -> None:
-        # get login information
-        username = G.args.addon.getSetting("crunchyroll_username")
-        password = G.args.addon.getSetting("crunchyroll_password")
-
-        headers = {"Authorization": API.AUTHORIZATION}
+    def create_session(self, action: str = "refresh", profile_id: Optional[str] = None) -> None:
+        """Create/refresh a session.
+        When action='login' we use the mobile client Basic auth with username/password (if provided).
+        Otherwise we use device client for refresh and profile refresh.
+        """
+        headers = {}
         data = {}
 
-        if action == "login":
+        if action == "refresh":
+            # Use device client to refresh a session
+            self.session_client = 'device'
+            headers = {"Authorization": f"Basic {API.CLIENT_AUTH_B64_DEVICE}"}
+            data = {
+                "refresh_token": self.account_data.refresh_token,
+                "grant_type": "refresh_token",
+                "scope": "offline_access",
+                "device_id": G.args.device_id,
+                "device_name": 'Kodi',
+                "device_type": 'MediaCenter'
+            }
+        elif action == "login":
+            # Username/password grant using MOBILE client (if supported)
+            # NOTE: This may fail if password grants are disabled; callers will fallback to device-code.
+            self.session_client = 'mobile'
+            headers = {"Authorization": f"Basic {API.CLIENT_AUTH_B64_MOBILE or API.CLIENT_AUTH_B64}"}
+            username = G.args.addon.getSetting("crunchyroll_username")
+            password = G.args.addon.getSetting("crunchyroll_password")
             data = {
                 "username": username,
                 "password": password,
@@ -134,16 +202,9 @@ class API:
                 "device_name": 'Kodi',
                 "device_type": 'MediaCenter'
             }
-        elif action == "refresh":
-            data = {
-                "refresh_token": self.account_data.refresh_token,
-                "grant_type": "refresh_token",
-                "scope": "offline_access",
-                "device_id": G.args.device_id,
-                "device_name": 'Kodi',
-                "device_type": 'MediaCenter'
-            }
         elif action == "refresh_profile":
+            self.session_client = 'device'
+            headers = {"Authorization": f"Basic {API.CLIENT_AUTH_B64_DEVICE}"}
             data = {
                 "device_id": G.args.device_id,
                 "device_name": 'Kodi',
@@ -161,15 +222,22 @@ class API:
         )
 
         # if refreshing and refresh token is expired, it will throw a 400
-        # retry with a fresh login, but limit retries to prevent loop in case something else went wrong
+        # clear session data and let caller handle re-authentication
         if r.status_code == 400:
-            utils.crunchy_log("Invalid/Expired credentials, restarting session from scratch")
+            utils.crunchy_log("Invalid/Expired credentials - refresh token is dead")
             self.retry_counter = self.retry_counter + 1
+            
+            # Clear session data
             self.account_data.delete_storage()
+            self.account_data = AccountData({})
+            
             if self.retry_counter > 2:
                 utils.crunchy_log("Max retries exceeded. Aborting!", xbmc.LOGERROR)
                 raise LoginError("Failed to authenticate twice")
-            return self.create_session()
+            
+            # Don't retry here - let start() handle the re-authentication
+            utils.crunchy_log("Session cleared - will trigger device-code flow")
+            return
 
         if r.status_code == 403:
             utils.crunchy_log("Possible cloudflare shenanigans")
@@ -185,32 +253,8 @@ class API:
 
         r_json = get_json_from_response(r)
 
-
-        self.account_data = AccountData({})
-
-        access_token = r_json["access_token"]
-        token_type = r_json["token_type"]
-        account_auth = {"Authorization": f"{token_type} {access_token}"}
-
-        account_data = dict()
-        account_data.update(r_json)
-        self.account_data = AccountData({})
-        self.api_headers = default_request_headers()
-        self.api_headers.update(account_auth)
-        account_data["expires"] = date_to_str(
-            get_date() + timedelta(seconds=float(account_data["expires_in"])))
-
-        r = self.make_request(
-            method="GET",
-            url=API.INDEX_ENDPOINT
-        )
-        account_data.update(r)
-
-        r = self.make_request(
-            method="GET",
-            url=API.PROFILE_ENDPOINT
-        )
-        account_data.update(r)
+        # Build account/profile and persist session
+        self._finalize_session_from_token_response(r_json)
 
         if action == "refresh_profile":
             # fetch all profiles from API
@@ -233,10 +277,193 @@ class API:
             # cache to file
             self.profile_data.write_to_storage()
 
+        # reset consecutive retry counter after a successful call
+        self.retry_counter = 0
+
+    def _load_client_config(self) -> None:
+        """Load dynamic client configuration from latest.json setting."""
+        latest_url = G.args.addon.getSetting("latest_json_url") or "https://reroll.is-cool.dev/latest.json"
+        utils.crunchy_log(f"Loading client config from: {latest_url}")
+        
+        try:
+            resp = self.http.get(latest_url, timeout=10)
+            if resp.ok:
+                cfg = resp.json()
+                utils.crunchy_log("Successfully loaded client configuration")
+                
+                # Load Android TV configuration
+                android_tv = cfg.get("android-tv", {})
+                if android_tv:
+                    API.CLIENT_AUTH_B64_DEVICE = android_tv.get("auth", API.CLIENT_AUTH_B64_DEVICE)
+                    API.UA_ATV = android_tv.get("user-agent", API.UA_ATV)
+                    API.APP_VERSION_ATV = android_tv.get("app-version", API.APP_VERSION_ATV)
+                    utils.crunchy_log("Loaded Android TV client configuration")
+
+                # Load mobile configuration
+                mobile = cfg.get("mobile", {})
+                if mobile:
+                    API.CLIENT_AUTH_B64_MOBILE = mobile.get("auth", API.CLIENT_AUTH_B64_MOBILE)
+                    API.UA_MOBILE = mobile.get("user-agent", API.UA_MOBILE)
+                    API.APP_VERSION_MOBILE = mobile.get("app-version", API.APP_VERSION_MOBILE)
+                    utils.crunchy_log("Loaded mobile client configuration")
+
+                # Backwards compatibility with flat structure
+                if not android_tv and not mobile:
+                    API.CLIENT_AUTH_B64 = cfg.get("auth", API.CLIENT_AUTH_B64)
+                    API.UA_MOBILE = cfg.get("user-agent", API.UA_MOBILE)
+                    API.APP_VERSION_MOBILE = cfg.get("app-version", API.APP_VERSION_MOBILE)
+                    utils.crunchy_log("Using legacy flat configuration structure")
+
+                # Set legacy attributes for backwards compatibility
+                API.CRUNCHYROLL_UA = API.UA_MOBILE or API.CRUNCHYROLL_UA
+                API.APP_VERSION = API.APP_VERSION_MOBILE or API.APP_VERSION
+
+                # Parse device client credentials from base64 (for Android TV auth)
+                if API.CLIENT_AUTH_B64_DEVICE:
+                    try:
+                        import base64
+                        decoded = base64.b64decode(API.CLIENT_AUTH_B64_DEVICE).decode('utf-8')
+                        client_id, client_secret = decoded.split(":", 1)
+                        self.DEVICE_CLIENT_ID = client_id
+                        self.DEVICE_CLIENT_SECRET = client_secret
+                        utils.crunchy_log("Parsed Android TV device client credentials")
+                    except (ValueError, Exception) as e:
+                        utils.crunchy_log(f"Failed to parse device credentials: {e}")
+            else:
+                utils.crunchy_log(f"Failed to load client config: HTTP {resp.status_code}")
+        except Exception as e:
+            utils.crunchy_log(f"Error loading client config: {e}")
+
+        # Update default headers with new user agent
+        self.api_headers = default_request_headers()
+
+    def init_cf_cookie(self) -> None:
+        """Trigger a 401 on content endpoint to obtain __cf_bm cookie."""
+        try:
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+            resp = scraper.get(
+                "https://www.crunchyroll.com/content/v2/discover/browse",
+                params={"locale": "en-US", "sort_by": "popularity", "n": 1},
+                headers={
+                    "Authorization": "Bearer",
+                    "Accept": "application/json",
+                    "Accept-Charset": "UTF-8"
+                },
+                timeout=10
+            )
+            self._update_cookie_from_scraper(scraper)
+        except requests.exceptions.RequestException:
+            pass
+
+    def acquire_anonymous_token(self) -> Optional[Dict]:
+        """Acquire anonymous access token (not used for content, helps establish session)."""
+        import uuid
+        self.etp_anonymous_id = str(uuid.uuid4())
+        try:
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+            r = scraper.post(
+                    API.TOKEN_ENDPOINT,
+                    headers={
+                        "ETP-Anonymous-ID": self.etp_anonymous_id,
+                        "Accept": "application/json",
+                        "Accept-Charset": "UTF-8",
+                        "Content-Type": "application/x-www-form-urlencoded"
+                    },
+                    data={
+                        "grant_type": "client_id",
+                        "scope": "offline_access",
+                        "client_id": self.DEVICE_CLIENT_ID,
+                        "client_secret": self.DEVICE_CLIENT_SECRET
+                    },
+                    timeout=15
+                )
+            if r.ok:
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def request_device_code(self) -> Optional[Dict]:
+        """Request device code for Android TV activation."""
+        try:
+            utils.crunchy_log(f"Requesting device code with Android TV client auth: {API.CLIENT_AUTH_B64_DEVICE[:20]}...")
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+            r = scraper.post(
+                API.DEVICE_CODE_ENDPOINT,
+                headers={
+                    "Authorization": f"Basic {API.CLIENT_AUTH_B64_DEVICE}",
+                    "Accept": "application/json",
+                    "Accept-Charset": "UTF-8",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={},
+                timeout=15
+            )
+            if r.ok:
+                self._update_cookie_from_scraper(scraper)
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def poll_device_token(self, device_code: str) -> Optional[Dict]:
+        """Poll for device token until activation occurs."""
+        try:
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+            r = scraper.post(
+                    API.DEVICE_TOKEN_ENDPOINT,
+                    headers={
+                        "Authorization": f"Basic {API.CLIENT_AUTH_B64_DEVICE}",
+                        "Accept": "application/json",
+                        "Accept-Charset": "UTF-8",
+                        "Content-Type": "application/json"
+                    },
+                    json={"device_code": device_code},
+                    timeout=15
+                )
+            if r.ok:
+                self.session_client = 'device'
+                self._update_cookie_from_scraper(scraper)
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def _finalize_session_from_token_response(self, r_json: Dict) -> None:
+        """Build session/account data from token response and fetch profile/index."""
+        access_token = r_json.get("access_token")
+        token_type = r_json.get("token_type", "Bearer")
+        account_auth = {"Authorization": f"{token_type} {access_token}"}
+
+        account_data = dict()
+        account_data.update(r_json)
+        self.account_data = AccountData({})
+        # switch UA based on session client
+        if self.session_client == 'device' and API.UA_ATV:
+            API.CRUNCHYROLL_UA = API.UA_ATV
+        elif API.UA_MOBILE:
+            API.CRUNCHYROLL_UA = API.UA_MOBILE
+
+        self.api_headers = default_request_headers()
+        self.api_headers.update(account_auth)
+        if r_json.get("expires_in"):
+            account_data["expires"] = date_to_str(
+                get_date() + timedelta(seconds=float(account_data["expires_in"])) )
+
+        r = self.make_request(
+            method="GET",
+            url=API.INDEX_ENDPOINT
+        )
+        account_data.update(r)
+
+        r = self.make_request(
+            method="GET",
+            url=API.PROFILE_ENDPOINT
+        )
+        account_data.update(r)
+
         self.account_data = AccountData(account_data)
         self.account_data.write_to_storage()
-
-        self.retry_counter = 0
 
     def close(self) -> None:
         """Saves cookies and session
@@ -263,7 +490,7 @@ class API:
             params = dict()
         if headers is None:
             headers = dict()
-        if self.account_data:
+        if self.account_data and "playback/v2" not in url:
             if expiration := self.account_data.expires:
                 current_time = get_date()
                 if current_time > str_to_date(expiration):
@@ -278,6 +505,11 @@ class API:
         request_headers.update(self.api_headers)
         request_headers.update(headers)
 
+        # ensure UA reflects active session; use ATV UA for ATV playback endpoint
+        if "playback/v2" in url and API.UA_ATV:
+            request_headers["User-Agent"] = API.UA_ATV
+        else:
+            request_headers["User-Agent"] = API.CRUNCHYROLL_UA
         r = self.http.request(
             method,
             url,
@@ -299,6 +531,58 @@ class API:
 
         return get_json_from_response(r)
 
+    def request_playback_v2(self, episode_id: str, audio: Optional[str] = None, queue: bool = False) -> Optional[Dict]:
+        """Call the Android TV playback v2 endpoint using cloudscraper."""
+        try:
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+            params = {"queue": str(queue).lower()}
+            if audio:
+                params["audio"] = audio
+            r = scraper.get(
+                API.STREAMS_ENDPOINT_DRM.format(episode_id),
+                headers={
+                    "Authorization": self.api_headers.get("Authorization", ""),
+                    "Accept": "application/json",
+                    "Accept-Charset": "UTF-8",
+                    "x-cr-stream-limits": "true",
+                    "Cookie": self.cf_cookie
+                },
+                params=params,
+                timeout=20
+            )
+            if r.ok:
+                self._update_cookie_from_scraper(scraper)
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
+        return None
+
+    def request_playback_phone(self, episode_id: str) -> Optional[Dict]:
+        """Fallback to legacy phone playback endpoint when ATV playback v2 fails."""
+        try:
+            return self.make_request(
+                method="GET",
+                url=API.STREAMS_ENDPOINT_DRM_PHONE.format(episode_id)
+            )
+        except Exception:
+            return None
+
+    def _update_cookie_from_scraper(self, scraper) -> None:
+        try:
+            # build cookie string for www.crunchyroll.com
+            cookie_names = [
+                '__cf_bm', 'SSID_GuUe', 'SSSC_GuUe', 'SSRT_GuUe', 'cr_exp'
+            ]
+            parts = []
+            for name in cookie_names:
+                val = scraper.cookies.get(name)
+                if val:
+                    parts.append(f"{name}={val}")
+            if parts:
+                self.cf_cookie = "; ".join(parts)
+        except Exception:
+            pass
+
     def make_unauthenticated_request(
             self,
             method: str,
@@ -318,10 +602,19 @@ class API:
 
 
 def default_request_headers() -> Dict:
-    return {
+    """Default headers for general API requests (content, navigation, etc.) using mobile client."""
+    headers = {
+        # Select a sane default UA (mobile) for general API requests.
         "User-Agent": API.CRUNCHYROLL_UA,
+        "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded"
     }
+    
+    # Add mobile client basic auth for general API requests
+    if API.CLIENT_AUTH_B64_MOBILE:
+        headers["Authorization"] = f"Basic {API.CLIENT_AUTH_B64_MOBILE}"
+    
+    return headers
 
 
 def get_date() -> datetime:

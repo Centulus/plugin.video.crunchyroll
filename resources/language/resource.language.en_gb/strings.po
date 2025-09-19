@@ -302,3 +302,8 @@ msgstr ""
 msgctxt "#30090"
 msgid "No search results"
 msgstr "No search results"
+
+# Settings labels (additional)
+msgctxt "#30300"
+msgid "Latest.json URL"
+msgstr "Latest.json URL"

@@ -79,6 +79,11 @@ msgctxt "#30021"
 msgid "English"
 msgstr "Inglés"
 
+# Ajustes adicionales
+msgctxt "#30300"
+msgid "Latest.json URL"
+msgstr "URL Latest.json"
+
 # 30022 free
 
 msgctxt "#30023"

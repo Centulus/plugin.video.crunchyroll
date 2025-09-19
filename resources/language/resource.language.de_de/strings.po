@@ -218,6 +218,11 @@ msgctxt "#30055"
 msgid "Alphabetical"
 msgstr "Von A bis Z"
 
+# Zusätzliche Einstellungen
+msgctxt "#30300"
+msgid "Latest.json URL"
+msgstr "Latest.json URL"
+
 msgctxt "#30056"
 msgid "Genres"
 msgstr "Genres"

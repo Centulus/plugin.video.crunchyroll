@@ -279,6 +279,11 @@ msgctxt "#30070"
 msgid "None"
 msgstr "Aucun"
 
+# Paramètres supplémentaires
+msgctxt "#30300"
+msgid "Latest.json URL"
+msgstr "URL Latest.json"
+
 msgctxt "#30071"
 msgid "Added to queue"
 msgstr "Ajouté à la file d'attente"

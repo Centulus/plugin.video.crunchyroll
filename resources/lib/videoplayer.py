@@ -436,8 +436,8 @@ class VideoPlayer(Object):
                 update_playhead(G.args.get_arg('episode_id'), int(current))
                 return
             
-            # Normal playback - update every 10 seconds
-            if (current - self.lastUpdatePlayhead) >= 10:
+            # Normal playback - update every 20 seconds
+            if (current - self.lastUpdatePlayhead) >= 20:
                 self.lastUpdatePlayhead = current
                 self.lastKnownTime = current
                 self.wasPlaying = True

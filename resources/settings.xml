@@ -24,6 +24,16 @@
                         <hidden>true</hidden>
                     </control>
                 </setting>
+                <setting id="latest_json_url" type="string" label="30300" help="">
+                    <level>0</level>
+                    <default>https://crunchyaddon.pastes.sh/raw/paste</default>
+                    <constraints>
+                        <allowempty>false</allowempty>
+                    </constraints>
+                    <control type="edit" format="string">
+                        <heading>30300</heading>
+                    </control>
+                </setting>
                 <setting id="device_id" type="string" label="30002" help="">
                     <level>4</level>
                     <default/>

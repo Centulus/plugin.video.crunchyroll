@@ -30,7 +30,6 @@ from resources.lib.gui import SkipModalDialog, show_modal_dialog
 from resources.lib.model import Object, CrunchyrollError, LoginError
 from resources.lib.videostream import VideoPlayerStreamData, VideoStream
 
-
 class VideoPlayer(Object):
     """ Handles playing video using data contained in args object
 
@@ -91,6 +90,17 @@ class VideoPlayer(Object):
             self.clearedStream = True
             self.waitForStart = False
             self.clear_active_stream()
+            # Clean up local MPD proxy server if running
+            try:
+                if hasattr(self, '_local_server') and self._local_server:
+                    self._local_server.shutdown()
+                    self._local_server.server_close()
+                    self._local_server = None
+                if hasattr(self, '_server_thread') and self._server_thread:
+                    self._server_thread.join(timeout=1.0)
+                    self._server_thread = None
+            except Exception:
+                pass
 
     def _get_video_stream_data(self) -> bool:
         """ Fetch all required stream data using VideoStream object """
@@ -155,23 +165,28 @@ class VideoPlayer(Object):
         is_helper = Helper("mpd", drm='com.widevine.alpha')
         #if is_helper.check_inputstream():
         manifest_headers = {
-            'User-Agent': G.api.CRUNCHYROLL_UA,
+            # Match Android TV okhttp behavior for MPD fetch - minimal headers only
             'Authorization': f"Bearer {G.api.account_data.access_token}"
         }
         license_headers = {
-            'User-Agent': G.api.CRUNCHYROLL_UA,
+            'User-Agent': getattr(G.api, 'UA_ATV', None) or G.api.CRUNCHYROLL_UA,
             'Content-Type': 'application/octet-stream',
             'Origin': 'https://static.crunchyroll.com',
             'Authorization': f"Bearer {G.api.account_data.access_token}",
             'x-cr-content-id': G.args.get_arg('episode_id'),
             'x-cr-video-token': self._stream_data.token
         }
+        if hasattr(G.api, 'cf_cookie') and G.api.cf_cookie:
+            license_headers['Cookie'] = G.api.cf_cookie
         license_config = {
             'license_server_url': G.api.LICENSE_ENDPOINT,
             'headers': urlencode(license_headers),
             'post_data': 'R{SSM}',
             'response_data': 'JBlicense'
         }
+
+        # Use cloudscraper to bypass Cloudflare protection via local HTTP proxy
+        self._setup_mpd_proxy(item, manifest_headers)
 
         inputstream_config = {
             'ssl_verify_peer': False
@@ -194,6 +209,60 @@ class VideoPlayer(Object):
 
         """ start playback"""
         xbmcplugin.setResolvedUrl(int(G.args.argv[1]), True, item)
+
+    def _setup_mpd_proxy(self, item, manifest_headers):
+        """Setup local HTTP proxy to serve MPD content via cloudscraper."""
+        try:
+            import threading
+            import http.server
+            import socketserver
+            from ..modules import cloudscraper
+            
+            # Fetch MPD via cloudscraper
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': 'okhttp/4.12.0'})
+            resp = scraper.get(self._stream_data.stream_url, headers=manifest_headers, timeout=15)
+            utils.crunchy_log(f"MPD fetch via cloudscraper: {resp.status_code}")
+            
+            if resp.ok and resp.headers.get('Content-Type', '').startswith('application/dash+xml'):
+                mpd_content = resp.text
+                
+                class MPDHandler(http.server.BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        if self.path == '/manifest.mpd':
+                            self.send_response(200)
+                            self.send_header('Content-Type', 'application/dash+xml')
+                            self.send_header('Content-Length', str(len(mpd_content.encode('utf-8'))))
+                            self.send_header('Access-Control-Allow-Origin', '*')
+                            self.end_headers()
+                            self.wfile.write(mpd_content.encode('utf-8'))
+                        else:
+                            self.send_error(404)
+                    
+                    def log_message(self, format, *args):
+                        pass  # Suppress HTTP server logs
+                
+                # Start local HTTP server
+                httpd = socketserver.TCPServer(("127.0.0.1", 0), MPDHandler)
+                port = httpd.server_address[1]
+                local_url = f"http://127.0.0.1:{port}/manifest.mpd"
+                
+                # Start server in background thread
+                server_thread = threading.Thread(target=httpd.serve_forever)
+                server_thread.daemon = True
+                server_thread.start()
+                
+                # Update item to use local proxy
+                item.setPath(local_url)
+                utils.crunchy_log(f"MPD proxy serving at: {local_url}")
+                
+                # Keep references for cleanup
+                self._local_server = httpd
+                self._server_thread = server_thread
+            else:
+                utils.crunchy_log(f"Failed to fetch MPD via cloudscraper: {resp.status_code}")
+                
+        except Exception as e:
+            utils.log_error_with_trace(f"MPD proxy setup failed: {e}", False)
 
     def update_playhead(self):
         """ background thread to update playback with crunchyroll in intervals """

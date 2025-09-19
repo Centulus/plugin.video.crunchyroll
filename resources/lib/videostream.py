@@ -122,24 +122,42 @@ class VideoStream(Object):
 
     @staticmethod
     async def _get_stream_data_from_api() -> Union[Dict, bool]:
-        """ get json stream data from cr api for given args.stream_id using new endpoint b/c drm """
+        """Fetch stream data from Crunchyroll playback API using Android TV endpoint."""
+        episode_id = G.args.get_arg('episode_id')
+        crunchy_log(f"Fetching stream data for episode: {episode_id}")
+        crunchy_log(f"Using endpoint: {G.api.STREAMS_ENDPOINT_DRM.format(episode_id)}")
 
-        # from utils import crunchy_log
-        crunchy_log("URL: %s" % G.api.STREAMS_ENDPOINT_DRM.format(G.args.get_arg('episode_id')))
+        try:
+            # Primary: Android TV playback v2 endpoint via cloudscraper (handles CF)
+            stream_data = G.api.request_playback_v2(episode_id, audio=G.args.subtitle)
 
-        req = G.api.make_request(
-            method="GET",
-            url=G.api.STREAMS_ENDPOINT_DRM.format(G.args.get_arg('episode_id')),
-        )
+            # Fallback: legacy phone endpoint if ATV fails, returns error, or misses essentials
+            if (not stream_data or
+                "error" in stream_data or
+                not isinstance(stream_data, dict) or
+                not stream_data.get('url') or
+                not stream_data.get('token')):
+                error_msg = stream_data.get('error', 'Unknown error') if stream_data else 'No response'
+                crunchy_log(f"ATV playback v2 failed: {error_msg} - trying phone fallback")
+                stream_data = G.api.request_playback_phone(episode_id)
 
-        # check for error
-        if "error" in req or req is None:
-            item = xbmcgui.ListItem(G.args.get_arg('title', 'Title not provided'))
-            xbmcplugin.setResolvedUrl(int(G.args.argv[1]), False, item)
-            xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30064))
+            if not stream_data or "error" in stream_data:
+                error_msg = stream_data.get('error', 'Unknown error') if stream_data else 'No response'
+                crunchy_log(f"Stream data fetch failed after fallback: {error_msg}")
+
+                # Show error dialog and fail playback
+                item = xbmcgui.ListItem(G.args.get_arg('title', 'Title not provided'))
+                xbmcplugin.setResolvedUrl(int(G.args.argv[1]), False, item)
+                xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30064))
+                return False
+
+            crunchy_log("Successfully fetched stream data")
+            return stream_data
+
+        except Exception as e:
+            crunchy_log(f"Exception during stream data fetch: {e}")
+            log_error_with_trace("Stream data fetch failed", False)
             return False
-
-        return req
 
     @staticmethod
     def _get_stream_url_from_api_data_v2(api_data: Dict) -> Union[str, None]:

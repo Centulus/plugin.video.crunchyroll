@@ -54,7 +54,14 @@ class CrunchyPlayer(xbmc.Player):
     def onPlayBackSeek(self, time, seekOffset):
         try:
             utils.crunchy_log(f"onPlayBackSeek: time={time}, offset={seekOffset}", xbmc.LOGINFO)
-            self._parent._on_seek()
+            # Kodi provides seek time in milliseconds; convert to seconds for playhead
+            try:
+                new_time_secs = int(round(float(time) / 1000.0))
+            except Exception:
+                # Fallback: assume already seconds
+                new_time_secs = int(time)
+            # Pass the normalized playback time to ensure reliable detection
+            self._parent._on_seek(new_time_secs)
         except Exception:
             pass
 
@@ -77,6 +84,7 @@ class VideoPlayer(Object):
         self.createTime = time.time()
         self._playing_url = None  # type: Optional[str]  # actual URL Kodi is playing (may be local proxy)
         self._paused = False  # Track pause state to send one-shot update on pause
+        self._last_seek_update_ts = 0.0  # Cooldown to prevent duplicate seek updates
 
     def start_playback(self):
         """ Set up player and start playback """
@@ -134,7 +142,7 @@ class VideoPlayer(Object):
             # Send final playhead update on finish to capture last position
             try:
                 if self._player and self._player.isPlayingVideo():
-                    final_pos = int(self._player.getTime())
+                    final_pos = self._safe_playhead(int(self._player.getTime()))
                     if final_pos > 0:
                         update_playhead(G.args.get_arg('episode_id'), final_pos)
             except Exception:
@@ -248,7 +256,6 @@ class VideoPlayer(Object):
         }
 
         item.setProperty("inputstream", "inputstream.adaptive")
-        item.setProperty("inputstream.adaptive.manifest_type", "mpd")
         item.setProperty("inputstream.adaptive.license_type", "com.widevine.alpha")
         item.setProperty('inputstream.adaptive.stream_headers', urlencode(manifest_headers))
         item.setProperty("inputstream.adaptive.manifest_headers", urlencode(manifest_headers))
@@ -264,6 +271,22 @@ class VideoPlayer(Object):
 
         """ start playback"""
         xbmcplugin.setResolvedUrl(int(G.args.argv[1]), True, item)
+
+    def _safe_playhead(self, seconds: int) -> int:
+        """Clamp playhead to a safe range [0, duration-1] to avoid overshoots/completions."""
+        try:
+            if seconds < 0:
+                return 0
+            total = 0
+            try:
+                total = int(self._player.getTotalTime()) if self._player else 0
+            except Exception:
+                total = 0
+            if total > 0:
+                return max(0, min(seconds, max(0, total - 1)))
+            return seconds
+        except Exception:
+            return max(0, seconds)
 
     def _setup_mpd_proxy(self, item, manifest_headers):
         """Setup local HTTP proxy to serve MPD content via cloudscraper."""
@@ -322,32 +345,45 @@ class VideoPlayer(Object):
             utils.log_error_with_trace(f"MPD proxy setup failed: {e}", False)
 
     # ==== Playback event handlers ====
+    def _emit_playhead(self, label: str, pos: int, force: bool = False):
+        """Helper to clamp, log, send, and update state for playhead updates."""
+        safe = self._safe_playhead(int(pos))
+        if not force and safe == int(self.lastUpdatePlayhead):
+            self.lastKnownTime = safe
+            return
+        utils.crunchy_log(f"{label} at {safe}", xbmc.LOGINFO)
+        update_playhead(G.args.get_arg('episode_id'), safe)
+        self.lastUpdatePlayhead = safe
+        self.lastKnownTime = safe
+        self.wasPlaying = True
+
+    def is_paused(self) -> bool:
+        try:
+            return bool(xbmc.getCondVisibility('Player.Paused'))
+        except Exception:
+            return self._paused
+
     def _on_started(self):
         try:
             current = int(self._player.getTime()) if self._player else 0
+            current = self._safe_playhead(current)
         except Exception:
             current = 0
         # Force an immediate playhead on start
         try:
-            utils.crunchy_log(f"Event: started -> playhead {current}", xbmc.LOGINFO)
-            update_playhead(G.args.get_arg('episode_id'), current)
+            self._emit_playhead("Event: started -> playhead", current, force=True)
             self.playheadSent = True
-            self.lastUpdatePlayhead = current
-            self.lastKnownTime = current
-            self.wasPlaying = True
         except Exception:
             pass
 
     def _on_paused(self):
         try:
             current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+            current = self._safe_playhead(current)
         except Exception:
             current = int(self.lastKnownTime)
         try:
-            utils.crunchy_log(f"Event: paused -> immediate playhead {current}", xbmc.LOGINFO)
-            update_playhead(G.args.get_arg('episode_id'), current)
-            self.lastKnownTime = current
-            self.wasPlaying = True
+            self._emit_playhead("Event: paused -> immediate playhead", current, force=True)
         except Exception:
             pass
 
@@ -360,17 +396,22 @@ class VideoPlayer(Object):
         except Exception:
             pass
 
-    def _on_seek(self):
+    def _on_seek(self, new_time: Optional[int] = None):
         try:
-            current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+            # Prefer the time provided by the event when available
+            if new_time is not None:
+                # Defensive: if mistakenly in ms, normalize to seconds
+                current = int(new_time)
+                if current > 24 * 60 * 60 * 12:  # > 12 hours is unrealistic for episodes
+                    current = int(round(current / 1000.0))
+            else:
+                current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+            current = self._safe_playhead(current)
         except Exception:
             current = int(self.lastKnownTime)
         try:
-            utils.crunchy_log(f"Event: seek -> immediate playhead {current}", xbmc.LOGINFO)
-            update_playhead(G.args.get_arg('episode_id'), current)
-            self.lastUpdatePlayhead = current
-            self.lastKnownTime = current
-            self.wasPlaying = True
+            self._emit_playhead("Event: seek -> immediate playhead", current, force=True)
+            self._last_seek_update_ts = time.time()
         except Exception:
             pass
 
@@ -405,11 +446,7 @@ class VideoPlayer(Object):
                 if not self._paused:
                     # Transition playing -> paused: send immediate update
                     self._paused = True
-                    self.lastUpdatePlayhead = current
-                    self.lastKnownTime = current
-                    self.wasPlaying = True
-                    utils.crunchy_log(f"Paused - immediate playhead update at {int(current)}", xbmc.LOGINFO)
-                    update_playhead(G.args.get_arg('episode_id'), int(current))
+                    self._emit_playhead("Paused - immediate playhead update", int(current), force=True)
                 # Stay paused: do not spam
                 return
             else:
@@ -420,33 +457,23 @@ class VideoPlayer(Object):
             # First playback start - immediate update
             if not self.playheadSent:
                 self.playheadSent = True
-                self.lastUpdatePlayhead = current
-                self.lastKnownTime = current
-                self.wasPlaying = True
-                utils.crunchy_log(f"Playback started - immediate playhead update at {int(current)}", xbmc.LOGINFO)
-                update_playhead(G.args.get_arg('episode_id'), int(current))
+                self._emit_playhead("Playback started - immediate playhead update", int(current), force=True)
                 return
             
-            # Detect seek (jump >3 seconds) - immediate update
-            if abs(current - self.lastKnownTime) > 3:
-                self.lastUpdatePlayhead = current
-                self.lastKnownTime = current
-                self.wasPlaying = True
-                utils.crunchy_log(f"Seek detected ({int(self.lastKnownTime)} -> {int(current)}) - immediate playhead update", xbmc.LOGINFO)
-                update_playhead(G.args.get_arg('episode_id'), int(current))
+            # Detect seek (jump >= 3 seconds) - immediate update
+            # Guard against double triggering right after onPlayBackSeek
+            now_ts = time.time()
+            if (now_ts - self._last_seek_update_ts) >= 1.0 and abs(current - self.lastKnownTime) >= 3:
+                self._emit_playhead("Seek detected - immediate playhead update", int(current), force=True)
                 return
             
             # Normal playback - update every 10 seconds
             if (current - self.lastUpdatePlayhead) >= 10:
-                self.lastUpdatePlayhead = current
-                self.lastKnownTime = current
-                self.wasPlaying = True
-                utils.crunchy_log(f"Regular playhead update at {int(current)}", xbmc.LOGINFO)
-                update_playhead(G.args.get_arg('episode_id'), int(current))
+                self._emit_playhead("Regular playhead update", int(current))
                 return
             
             # Update tracking vars even when not sending
-            self.lastKnownTime = current
+            self.lastKnownTime = self._safe_playhead(int(current))
             self.wasPlaying = True
             
         except Exception as e:

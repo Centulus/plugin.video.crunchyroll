@@ -276,13 +276,25 @@ class ListableItem(Object):
         # if is a playable item, set some things
         if hasattr(self, 'duration'):
             li.setProperty("IsPlayable", "true")
-            li.setProperty('TotalTime', str(float(getattr(self, 'duration'))))
-            # set resume if not fully watched and playhead > x
-            if hasattr(self, 'playcount') and getattr(self, 'playcount') == 0:
-                if hasattr(self, 'playhead') and getattr(self, 'playhead') > 0:
-                    resume = int(getattr(self, 'playhead') / getattr(self, 'duration') * 100)
-                    if 5 <= resume <= 90:
-                        li.setProperty('ResumeTime', str(float(getattr(self, 'playhead'))))
+            try:
+                tag = li.getVideoInfoTag()
+                duration = int(float(getattr(self, 'duration')) or 0)
+                if duration > 0:
+                    tag.setDuration(duration)
+                # set resume using InfoTagVideo if not fully watched and gating passes
+                if hasattr(self, 'playcount') and getattr(self, 'playcount') == 0:
+                    playhead = int(float(getattr(self, 'playhead')) or 0) if hasattr(self, 'playhead') else 0
+                    if duration > 0 and playhead > 0:
+                        min_sec = 10
+                        min_pct = 0.01
+                        max_pct = 0.95
+                        lower_bound = max(min_sec, int(duration * min_pct))
+                        upper_bound = int(duration * max_pct)
+                        if lower_bound <= playhead <= upper_bound:
+                            tag.setResumePoint(playhead, duration)
+            except Exception:
+                # Fallback is no-op; avoid deprecated setInfo properties
+                pass
 
         li.setInfo('video', list_info)
         li.setArt({

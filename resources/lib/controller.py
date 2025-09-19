@@ -507,6 +507,7 @@ def start_playback():
     while (not G.monitor.abortRequested()) and video_player.isStartingOrPlaying():
         video_player.check_skipping()
         if G.args.addon.getSetting("sync_playtime") == "true":
+            utils.crunchy_log("Calling update_playhead from main loop", xbmc.LOGDEBUG)
             video_player.update_playhead()
         G.monitor.waitForAbort(1)
     video_player.finished()

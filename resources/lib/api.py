@@ -76,6 +76,8 @@ class API:
     # WATCHLIST_REMOVE_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/watchlist/{}"
     WATCHLIST_V2_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/watchlist"
     PLAYHEADS_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/playheads"
+    # Android TV clients post playheads to the www host
+    PLAYHEADS_ENDPOINT_WWW = "https://www.crunchyroll.com/content/v2/{}/playheads"
     HISTORY_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/watch-history"
     RESUME_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/discover/{}/history"
     SEASONAL_TAGS_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/discover/seasonal_tags"
@@ -347,7 +349,8 @@ class API:
                 headers={
                     "Authorization": "Bearer",
                     "Accept": "application/json",
-                    "Accept-Charset": "UTF-8"
+                    "Accept-Charset": "UTF-8",
+                    "Content-Type": "application/x-www-form-urlencoded"
                 },
                 timeout=10
             )
@@ -607,7 +610,8 @@ def default_request_headers() -> Dict:
         # Select a sane default UA (mobile) for general API requests.
         "User-Agent": API.CRUNCHYROLL_UA,
         "Accept": "application/json",
-        "Content-Type": "application/x-www-form-urlencoded"
+           "Content-Type": "application/x-www-form-urlencoded",
+           "Accept-Charset": "UTF-8"
     }
     
     # Add mobile client basic auth for general API requests
@@ -646,7 +650,6 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
 
     code: int = r.status_code
     response_type: str = r.headers.get("Content-Type")
-
     # no content - possibly POST/DELETE request?
     if not r or not r.text:
         try:

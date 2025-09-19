@@ -30,6 +30,34 @@ from resources.lib.gui import SkipModalDialog, show_modal_dialog
 from resources.lib.model import Object, CrunchyrollError, LoginError
 from resources.lib.videostream import VideoPlayerStreamData, VideoStream
 
+
+class CrunchyPlayer(xbmc.Player):
+    """Custom player to capture playback events for immediate playhead updates."""
+    def __init__(self, parent):
+        super().__init__()
+        self._parent = parent
+
+    def onAVStarted(self):
+        try:
+            utils.crunchy_log("onAVStarted: playback started", xbmc.LOGINFO)
+            self._parent._on_started()
+        except Exception:
+            pass
+
+    def onPlayBackStarted(self):
+        try:
+            utils.crunchy_log("onPlayBackStarted: playback started", xbmc.LOGINFO)
+            self._parent._on_started()
+        except Exception:
+            pass
+
+    def onPlayBackSeek(self, time, seekOffset):
+        try:
+            utils.crunchy_log(f"onPlayBackSeek: time={time}, offset={seekOffset}", xbmc.LOGINFO)
+            self._parent._on_seek()
+        except Exception:
+            pass
+
 class VideoPlayer(Object):
     """ Handles playing video using data contained in args object
 
@@ -37,13 +65,18 @@ class VideoPlayer(Object):
     """
 
     def __init__(self):
-        self._stream_data: VideoPlayerStreamData | None = None  # @todo: maybe rename prop and class?
-        self._player: Optional[xbmc.Player] = xbmc.Player()  # @todo: what about garbage collection?
+        self._stream_data = None  # type: Optional[VideoPlayerStreamData]
+        self._player = CrunchyPlayer(self)  # use custom player to receive events
         self._skip_modal_duration_max = 10
         self.waitForStart = True
         self.lastUpdatePlayhead = 0
+        self.lastKnownTime = 0  # Track for seek detection
+        self.wasPlaying = False  # Track for pause detection
+        self.playheadSent = False  # Track if we sent initial playhead
         self.clearedStream = False
         self.createTime = time.time()
+        self._playing_url = None  # type: Optional[str]  # actual URL Kodi is playing (may be local proxy)
+        self._paused = False  # Track pause state to send one-shot update on pause
 
     def start_playback(self):
         """ Set up player and start playback """
@@ -61,11 +94,12 @@ class VideoPlayer(Object):
         self._prepare_and_start_playback()
 
     def isPlaying(self) -> bool:
-        if not self._stream_data:
+        if not self._stream_data or not self._player:
             return False
-        if self._player.isPlaying() and self._stream_data.stream_url == self._player.getPlayingFile():
-            return True
-        else:
+        # Rely on Kodi's state; comparing paths is unreliable (plugin:// vs local proxy)
+        try:
+            return bool(self._player.isPlayingVideo())
+        except Exception:
             return False
 
     def isStartingOrPlaying(self) -> bool:
@@ -73,6 +107,14 @@ class VideoPlayer(Object):
 
         if not self._stream_data:
             return False
+
+        # Consider paused state as active playback for our loop
+        try:
+            if xbmc.getCondVisibility('Player.Paused'):
+                self.waitForStart = False
+                return True
+        except Exception:
+            pass
 
         if self.isPlaying():
             self.waitForStart = False
@@ -89,6 +131,14 @@ class VideoPlayer(Object):
         if not self.clearedStream or forced:
             self.clearedStream = True
             self.waitForStart = False
+            # Send final playhead update on finish to capture last position
+            try:
+                if self._player and self._player.isPlayingVideo():
+                    final_pos = int(self._player.getTime())
+                    if final_pos > 0:
+                        update_playhead(G.args.get_arg('episode_id'), final_pos)
+            except Exception:
+                pass
             self.clear_active_stream()
             # Clean up local MPD proxy server if running
             try:
@@ -155,14 +205,19 @@ class VideoPlayer(Object):
             )
 
         item = self._stream_data.playable_item.to_item()
+        # Track the (initial) playing URL. Might change to local proxy later.
         item.setPath(self._stream_data.stream_url)
+        self._playing_url = self._stream_data.stream_url
         item.setMimeType('application/dash+xml')
         item.setContentLookup(False)
 
         # inputstream adaptive
-        from inputstreamhelper import Helper  # noqa
+        try:
+            from inputstreamhelper import Helper  # type: ignore
+        except Exception:
+            Helper = None  # type: ignore
 
-        is_helper = Helper("mpd", drm='com.widevine.alpha')
+        is_helper = Helper("mpd", drm='com.widevine.alpha') if Helper else None
         #if is_helper.check_inputstream():
         manifest_headers = {
             # Match Android TV okhttp behavior for MPD fetch - minimal headers only
@@ -258,25 +313,144 @@ class VideoPlayer(Object):
                 # Keep references for cleanup
                 self._local_server = httpd
                 self._server_thread = server_thread
+                # Ensure isPlaying() checks the local proxy URL
+                self._playing_url = local_url
             else:
                 utils.crunchy_log(f"Failed to fetch MPD via cloudscraper: {resp.status_code}")
                 
         except Exception as e:
             utils.log_error_with_trace(f"MPD proxy setup failed: {e}", False)
 
-    def update_playhead(self):
-        """ background thread to update playback with crunchyroll in intervals """
+    # ==== Playback event handlers ====
+    def _on_started(self):
+        try:
+            current = int(self._player.getTime()) if self._player else 0
+        except Exception:
+            current = 0
+        # Force an immediate playhead on start
+        try:
+            utils.crunchy_log(f"Event: started -> playhead {current}", xbmc.LOGINFO)
+            update_playhead(G.args.get_arg('episode_id'), current)
+            self.playheadSent = True
+            self.lastUpdatePlayhead = current
+            self.lastKnownTime = current
+            self.wasPlaying = True
+        except Exception:
+            pass
 
-        # store playtime of last update and compare before updating, so it won't update while e.g. pausing
-        if (self.isPlaying() and
-                (self._player.getTime() - self.lastUpdatePlayhead) > 10
-        ):
-            self.lastUpdatePlayhead = self._player.getTime()
-            # api request
-            update_playhead(
-                G.args.get_arg('episode_id'),
-                int(self._player.getTime())
-            )
+    def _on_paused(self):
+        try:
+            current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+        except Exception:
+            current = int(self.lastKnownTime)
+        try:
+            utils.crunchy_log(f"Event: paused -> immediate playhead {current}", xbmc.LOGINFO)
+            update_playhead(G.args.get_arg('episode_id'), current)
+            self.lastKnownTime = current
+            self.wasPlaying = True
+        except Exception:
+            pass
+
+    def _on_resumed(self):
+        # No mandatory update, but keep tracking vars in sync
+        try:
+            current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+            self.lastKnownTime = current
+            utils.crunchy_log("Event: resumed", xbmc.LOGINFO)
+        except Exception:
+            pass
+
+    def _on_seek(self):
+        try:
+            current = int(self._player.getTime()) if self._player else int(self.lastKnownTime)
+        except Exception:
+            current = int(self.lastKnownTime)
+        try:
+            utils.crunchy_log(f"Event: seek -> immediate playhead {current}", xbmc.LOGINFO)
+            update_playhead(G.args.get_arg('episode_id'), current)
+            self.lastUpdatePlayhead = current
+            self.lastKnownTime = current
+            self.wasPlaying = True
+        except Exception:
+            pass
+
+    def _on_stopped(self, ended: bool):
+        # Send final update and clean up
+        try:
+            utils.crunchy_log(f"Event: {'ended' if ended else 'stopped'} -> finalize", xbmc.LOGINFO)
+        except Exception:
+            pass
+        self.finished(forced=True)
+
+    def update_playhead(self):
+        """ Smart playhead updates: immediate on events, periodic during normal playback """
+        if not self.isPlaying():
+            # If we were playing before and now stopped, send final position (pause/stop)
+            if self.wasPlaying and self.lastKnownTime > 0:
+                utils.crunchy_log(f"Playback paused/stopped - immediate playhead update at {int(self.lastKnownTime)}", xbmc.LOGINFO)
+                update_playhead(G.args.get_arg('episode_id'), int(self.lastKnownTime))
+                self.wasPlaying = False
+            return
+        
+        try:
+            current = self._player.getTime()
+            # Detect explicit pause via Kodi condition
+            is_paused = False
+            try:
+                is_paused = xbmc.getCondVisibility('Player.Paused')
+            except Exception:
+                pass
+
+            if is_paused:
+                if not self._paused:
+                    # Transition playing -> paused: send immediate update
+                    self._paused = True
+                    self.lastUpdatePlayhead = current
+                    self.lastKnownTime = current
+                    self.wasPlaying = True
+                    utils.crunchy_log(f"Paused - immediate playhead update at {int(current)}", xbmc.LOGINFO)
+                    update_playhead(G.args.get_arg('episode_id'), int(current))
+                # Stay paused: do not spam
+                return
+            else:
+                if self._paused:
+                    # Transition paused -> playing
+                    self._paused = False
+            
+            # First playback start - immediate update
+            if not self.playheadSent:
+                self.playheadSent = True
+                self.lastUpdatePlayhead = current
+                self.lastKnownTime = current
+                self.wasPlaying = True
+                utils.crunchy_log(f"Playback started - immediate playhead update at {int(current)}", xbmc.LOGINFO)
+                update_playhead(G.args.get_arg('episode_id'), int(current))
+                return
+            
+            # Detect seek (jump >3 seconds) - immediate update
+            if abs(current - self.lastKnownTime) > 3:
+                self.lastUpdatePlayhead = current
+                self.lastKnownTime = current
+                self.wasPlaying = True
+                utils.crunchy_log(f"Seek detected ({int(self.lastKnownTime)} -> {int(current)}) - immediate playhead update", xbmc.LOGINFO)
+                update_playhead(G.args.get_arg('episode_id'), int(current))
+                return
+            
+            # Normal playback - update every 10 seconds
+            if (current - self.lastUpdatePlayhead) >= 10:
+                self.lastUpdatePlayhead = current
+                self.lastKnownTime = current
+                self.wasPlaying = True
+                utils.crunchy_log(f"Regular playhead update at {int(current)}", xbmc.LOGINFO)
+                update_playhead(G.args.get_arg('episode_id'), int(current))
+                return
+            
+            # Update tracking vars even when not sending
+            self.lastKnownTime = current
+            self.wasPlaying = True
+            
+        except Exception as e:
+            utils.crunchy_log(f"update_playhead failed: {e}", xbmc.LOGERROR)
 
     def check_skipping(self):
         """ background thread to check and handle skipping intro/credits/... """
@@ -387,25 +561,58 @@ def update_playhead(content_id: str, playhead: int):
 
     # if sync_playtime is disabled in settings, do nothing
     if G.args.addon.getSetting("sync_playtime") != "true":
+        utils.crunchy_log("Playhead sync disabled in settings", xbmc.LOGINFO)
         return
 
+    utils.crunchy_log(f"Sending playhead update: content_id={content_id}, playhead={playhead}", xbmc.LOGINFO)
+
     try:
-        G.api.make_request(
-            method="POST",
-            url=G.api.PLAYHEADS_ENDPOINT.format(G.api.account_data.account_id),
-            json_data={
-                'playhead': playhead,
-                'content_id': content_id
-            },
-            headers={
-                'Content-Type': 'application/json'
-            }
+        # Ensure Cloudflare cookie present for www endpoint requests
+        if not getattr(G.api, 'cf_cookie', None):
+            try:
+                utils.crunchy_log("Initializing Cloudflare cookie for playhead request", xbmc.LOGINFO)
+                G.api.init_cf_cookie()
+            except Exception as e:
+                utils.crunchy_log(f"Failed to init CF cookie: {e}", xbmc.LOGWARNING)
+                pass
+        # Post with cloudscraper to bypass Cloudflare on Android TV endpoints
+        from ..modules import cloudscraper
+        scraper = cloudscraper.create_scraper(
+            delay=10,
+            browser={'custom': getattr(G.api, 'UA_ATV', None) or G.api.CRUNCHYROLL_UA}
         )
+        headers = {
+            'User-Agent': getattr(G.api, 'UA_ATV', None) or G.api.CRUNCHYROLL_UA,
+            'Authorization': f"Bearer {G.api.account_data.access_token}",
+            'Accept': 'application/json',
+            'Accept-Charset': 'UTF-8',
+            'Content-Type': 'application/json'
+        }
+        url = G.api.PLAYHEADS_ENDPOINT_WWW.format(G.api.account_data.account_id)
+        payload = {'playhead': playhead, 'content_id': content_id}
+        
+        utils.crunchy_log(f"POST {url} with payload {payload}", xbmc.LOGINFO)
+        
+        r = scraper.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        
+        utils.crunchy_log(f"Playhead response: {r.status_code} - {r.text[:200]}", xbmc.LOGINFO)
+        
+        if not r.ok:
+            raise CrunchyrollError(f"[{r.status_code}] {r.text[:200]}")
+            
+        utils.crunchy_log(f"Successfully updated playhead to {playhead} for {content_id}", xbmc.LOGINFO)
+        
     except (CrunchyrollError, requests.exceptions.RequestException) as e:
         # catch timeout or any other possible exception
         utils.crunchy_log(
-            "Failed to update playhead to crunchyroll: %s for %s" % (
-                str(e), content_id
-            )
+            f"Failed to update playhead to crunchyroll: {str(e)[:200]} for {content_id}",
+            xbmc.LOGERROR
         )
         pass
+    except Exception as e:
+        utils.crunchy_log(f"Unexpected error updating playhead: {e}", xbmc.LOGERROR)

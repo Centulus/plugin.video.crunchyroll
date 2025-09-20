@@ -216,21 +216,122 @@ class ActivationDialog(xbmcgui.WindowXMLDialog):
             # Update status
             self._update_qr_status("Generating QR code...")
 
-            # Generate QR code image with the known-good segno API (make_qr)
-            from .segno import make_qr
+            # Generate QR code image using the lightweight pyqrcode module
+            import os
+            import struct
+            import zlib
+            _pyqrcode = None
+            try:
+                from resources.modules import pyqrcode as _pyqrcode
+            except Exception:
+                try:
+                    from ..modules import pyqrcode as _pyqrcode
+                except Exception:
+                    try:
+                        import sys
+                        addon_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                        if addon_root and addon_root not in sys.path:
+                            sys.path.insert(0, addon_root)
+                        from resources.modules import pyqrcode as _pyqrcode
+                    except Exception:
+                        xbmc.log("[Crunchyroll] Failed to import pyqrcode module", xbmc.LOGERROR)
+                        self._update_qr_status("pyqrcode module not found. Use the code above.")
+                        return
             import xbmcvfs
             import os
 
             temp_dir = xbmcvfs.translatePath('special://temp/')
             qr_path = os.path.join(temp_dir, 'crunchyroll_qr.png')
+            # Remove any older QR files to avoid cache confusion
+            try:
+                for old in ('special://temp/crunchyroll_qr.png', 'special://temp/crunchyroll_qr.bmp', 'special://temp/crunchyroll_qr.svg'):
+                    if xbmcvfs.exists(old):
+                        xbmcvfs.delete(old)
+            except Exception:
+                pass
 
-            qr = make_qr(qr_url)
-            qr.save(qr_path, scale=10, border=4)
+            def _write_png_rgb(path, pixels, width, height):
+                """Write a minimal 24-bit RGB PNG. pixels: iterable of rows of bytes (len=width*3)."""
+                def _chunk(fh, ctype, data):
+                    fh.write(struct.pack('>I', len(data)))
+                    fh.write(ctype)
+                    fh.write(data)
+                    crc = zlib.crc32(ctype)
+                    crc = zlib.crc32(data, crc) & 0xffffffff
+                    fh.write(struct.pack('>I', crc))
+
+                with open(path, 'wb') as fh:
+                    # PNG signature
+                    fh.write(b'\x89PNG\r\n\x1a\n')
+                    # IHDR
+                    ihdr = struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)  # 8-bit, RGB
+                    _chunk(fh, b'IHDR', ihdr)
+                    # IDAT
+                    # Prepend each scanline with filter type 0
+                    raw = bytearray()
+                    for row in pixels:
+                        raw.append(0)
+                        raw.extend(row)
+                    compressed = zlib.compress(bytes(raw), level=9)
+                    _chunk(fh, b'IDAT', compressed)
+                    # IEND
+                    _chunk(fh, b'IEND', b'')
+
+            try:
+                # Generate QR matrix
+                qr = _pyqrcode.create(qr_url)
+                qr_matrix = qr.code
+                scale = 8  # pixels per module for better visibility
+                quiet_zone = 4
+                matrix_size = len(qr_matrix)
+                img_size = (matrix_size + 2 * quiet_zone) * scale
+
+                # Build RGB rows top-to-bottom (PNG uses top-down)
+                rows = []
+                for y in range(img_size):
+                    row = bytearray()
+                    for x in range(img_size):
+                        mx = (x // scale) - quiet_zone
+                        my = (y // scale) - quiet_zone
+                        is_black = 0 <= mx < matrix_size and 0 <= my < matrix_size and qr_matrix[my][mx] == 1
+                        if is_black:
+                            row += b'\x00\x00\x00'
+                        else:
+                            row += b'\xFF\xFF\xFF'
+                    rows.append(bytes(row))
+
+                _write_png_rgb(qr_path, rows, img_size, img_size)
+                xbmc.log(f"[Crunchyroll] QR code PNG generated successfully", xbmc.LOGINFO)
+            except Exception as e_gen:
+                xbmc.log(f"[Crunchyroll] pyqrcode PNG generation failed: {e_gen}", xbmc.LOGERROR)
+                self._update_qr_status("Unable to generate QR code. Use the code above.")
+                return
 
             if xbmcvfs.exists(qr_path):
                 stat = xbmcvfs.Stat(qr_path)
                 xbmc.log(f"[Crunchyroll] QR code generated at: {qr_path} ({stat.st_size()} bytes)", xbmc.LOGINFO)
-                self.getControl(4001).setImage(qr_path)  # noqa
+                # Use special:// path for Kodi to resolve correctly; disable cache to force refresh
+                display_path = 'special://temp/crunchyroll_qr.png'
+                ctrl = self.getControl(4001)
+                set_ok = False
+                try:
+                    xbmc.log(f"[Crunchyroll] Setting QR image (special): {display_path}", xbmc.LOGINFO)
+                    ctrl.setVisible(True)
+                    try:
+                        ctrl.setImage('', False)  # clear first
+                    except Exception:
+                        pass
+                    # tiny delay to ensure file is flushed
+                    try:
+                        import time as _t
+                        _t.sleep(0.05)
+                    except Exception:
+                        pass
+                    ctrl.setImage(display_path, False)
+                    set_ok = True
+                except Exception as e1:
+                    xbmc.log(f"[Crunchyroll] setImage special:// failed: {e1}", xbmc.LOGWARNING)
+                    
                 self._update_qr_status("")  # Clear status text
             else:
                 xbmc.log("[Crunchyroll] QR file does not exist!", xbmc.LOGERROR)
@@ -253,13 +354,3 @@ class ActivationDialog(xbmcgui.WindowXMLDialog):
             self.getControl(4002).setText(self.info)  # noqa
         except Exception:
             pass
-
-    def _generate_qr_code(self, url: str) -> str:
-        """Kept for compatibility but no longer used (generation moved to set_qr)."""
-        from .segno import make_qr
-        import xbmcvfs, os
-        temp_dir = xbmcvfs.translatePath('special://temp/')
-        qr_path = os.path.join(temp_dir, 'crunchyroll_qr.png')
-        qr = make_qr(url)
-        qr.save(qr_path, scale=10, border=4)
-        return qr_path if xbmcvfs.exists(qr_path) else ""

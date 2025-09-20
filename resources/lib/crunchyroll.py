@@ -176,11 +176,20 @@ def main(argv):
 
         xbmcplugin.setContent(int(G.args.argv[1]), "tvshows")
         return check_mode()
-    except (LoginError, CrunchyrollError):
+    except LoginError:
         utils.crunchy_log("Login failed", xbmc.LOGERROR)
         view.add_item({"title": G.args.addon.getLocalizedString(30060)})
         view.end_of_directory()
         xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30060))
+        return False
+    except CrunchyrollError as e:
+        try:
+            utils.crunchy_log(f"Request failed: {e}; last_request={getattr(G.api, 'last_request', {})}", xbmc.LOGERROR)
+        except Exception:
+            utils.crunchy_log(f"Request failed: {e}", xbmc.LOGERROR)
+        view.add_item({"title": G.args.addon.getLocalizedString(30061)})
+        view.end_of_directory()
+        xbmcgui.Dialog().notification(G.args.addon_name, G.args.addon.getLocalizedString(30061), xbmcgui.NOTIFICATION_ERROR, 4)
         return False
 
 
@@ -266,10 +275,12 @@ def check_mode():
 def show_main_menu():
     """Show main menu
     """
-    view.add_item({"title": G.args.addon.getLocalizedString(30040),
+    # Replace legacy 'Queue' with 'Watchlist'
+    view.add_item({"title": G.args.addon.getLocalizedString(30096),
                    "mode": "queue"})
     view.add_item({"title": G.args.addon.getLocalizedString(30047),
                    "mode": "resume"})
+    # (Removed duplicate Watchlist entry that was placed after Resume)
     view.add_item({"title": G.args.addon.getLocalizedString(30041),
                    "mode": "search"})
     view.add_item({"title": G.args.addon.getLocalizedString(30042),

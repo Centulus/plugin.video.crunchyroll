@@ -239,6 +239,10 @@ msgctxt "#30059"
 msgid "Newest"
 msgstr "Neuste"
 
+msgctxt "#30096"
+msgid "Watchlist"
+msgstr "Merkliste"
+
 
 # Crunchyroll Messages
 

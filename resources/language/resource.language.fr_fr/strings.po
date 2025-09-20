@@ -218,6 +218,10 @@ msgctxt "#30055"
 msgid "Alphabetical"
 msgstr "Alphabétique"
 
+msgctxt "#30096"
+msgid "Watchlist"
+msgstr "Watchlist"
+
 msgctxt "#30056"
 msgid "Genres"
 msgstr "Genres"

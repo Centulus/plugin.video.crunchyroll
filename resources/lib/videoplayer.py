@@ -143,7 +143,7 @@ class VideoPlayer(Object):
             try:
                 if self._player and self._player.isPlayingVideo():
                     final_pos = self._safe_playhead(int(self._player.getTime()))
-                    if final_pos > 0:
+                    if final_pos >= 10:
                         update_playhead(G.args.get_arg('episode_id'), final_pos)
             except Exception:
                 pass
@@ -348,8 +348,15 @@ class VideoPlayer(Object):
     def _emit_playhead(self, label: str, pos: int, force: bool = False):
         """Helper to clamp, log, send, and update state for playhead updates."""
         safe = self._safe_playhead(int(pos))
+        # don't spam duplicates
         if not force and safe == int(self.lastUpdatePlayhead):
             self.lastKnownTime = safe
+            return
+        # gate tiny positions; we don't persist <10s
+        if safe < 10:
+            self.lastKnownTime = safe
+            self.wasPlaying = True
+            utils.crunchy_log(f"{label} below 10s -> skip send ({safe}s)", xbmc.LOGDEBUG)
             return
         utils.crunchy_log(f"{label} at {safe}", xbmc.LOGINFO)
         update_playhead(G.args.get_arg('episode_id'), safe)
@@ -427,7 +434,7 @@ class VideoPlayer(Object):
         """ Smart playhead updates: immediate on events, periodic during normal playback """
         if not self.isPlaying():
             # If we were playing before and now stopped, send final position (pause/stop)
-            if self.wasPlaying and self.lastKnownTime > 0:
+            if self.wasPlaying and self.lastKnownTime >= 10:
                 utils.crunchy_log(f"Playback paused/stopped - immediate playhead update at {int(self.lastKnownTime)}", xbmc.LOGINFO)
                 update_playhead(G.args.get_arg('episode_id'), int(self.lastKnownTime))
                 self.wasPlaying = False
@@ -446,7 +453,8 @@ class VideoPlayer(Object):
                 if not self._paused:
                     # Transition playing -> paused: send immediate update
                     self._paused = True
-                    self._emit_playhead("Paused - immediate playhead update", int(current), force=True)
+                    if int(current) >= 10:
+                        self._emit_playhead("Paused - immediate playhead update", int(current), force=True)
                 # Stay paused: do not spam
                 return
             else:
@@ -591,6 +599,12 @@ def update_playhead(content_id: str, playhead: int):
         utils.crunchy_log("Playhead sync disabled in settings", xbmc.LOGINFO)
         return
 
+    # don't store tiny blips; resume starts at >=10s
+    min_resume = 10
+    if playhead < min_resume:
+        utils.crunchy_log(f"Skip playhead update (<{min_resume}s): content_id={content_id}, playhead={playhead}", xbmc.LOGDEBUG)
+        return
+
     utils.crunchy_log(f"Sending playhead update: content_id={content_id}, playhead={playhead}", xbmc.LOGINFO)
 
     try:
@@ -654,9 +668,9 @@ def update_playhead(content_id: str, playhead: int):
 
         if not r.ok:
             raise CrunchyrollError(f"[{r.status_code}] {r.text[:200]}")
-            
+
         utils.crunchy_log(f"Successfully updated playhead to {playhead} for {content_id}", xbmc.LOGINFO)
-        
+
     except (CrunchyrollError, requests.exceptions.RequestException) as e:
         # catch timeout or any other possible exception
         utils.crunchy_log(

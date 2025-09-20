@@ -35,7 +35,7 @@ def show_profiles():
     # api request
     req = G.api.make_request(
         method="GET",
-        url=G.api.PROFILES_LIST_ENDPOINT
+        url=G.api.PROFILES_LIST_ENDPOINT.format(G.api.account_data.account_id)
     )
 
     # check for error
@@ -73,7 +73,7 @@ def show_profiles():
 
 
 def show_queue():
-    """ shows anime queue/playlist
+    """ shows anime watchlist
     """
     # api request
     req = G.api.make_request(
@@ -81,6 +81,7 @@ def show_queue():
         url=G.api.WATCHLIST_LIST_ENDPOINT.format(G.api.account_data.account_id),
         params={
             "n": 1024,
+            "start": 0,
             "locale": G.args.subtitle
         }
     )
@@ -91,8 +92,14 @@ def show_queue():
         view.end_of_directory()
         return False
 
+    data = req.get('data') or []
+    if not data:
+        view.add_item({"title": G.args.addon.getLocalizedString(30090)})
+        view.end_of_directory()
+        return False
+
     view.add_listables(
-        listables=get_listables_from_response(req.get('items')),
+        listables=get_listables_from_response(data),
         is_folder=False,
         options=view.OPT_CTX_SEASONS | view.OPT_CTX_EPISODES  # | view.OPT_SORT_EPISODES_EXPERIMENTAL
     )
@@ -126,7 +133,7 @@ def search_anime():
             "q": d,
             "locale": G.args.subtitle,
             "start": G.args.get_arg('offset', 0, int),
-            "type": "series"
+            "type": "top_results"
         }
     )
 
@@ -150,7 +157,7 @@ def search_anime():
     )
 
     # pagination
-    items_left = type_data.get('total') - (G.args.get_arg('offset', 0, int) * 50) - len(type_data.get('items'))
+    items_left = type_data.get('total', 0) - (G.args.get_arg('offset', 0, int) * 50) - len(type_data.get('items') or [])
     if items_left > 0:
         view.add_item(
             {
@@ -195,7 +202,7 @@ def show_history():
     )
 
     # pagination
-    num_pages = int(math.ceil(req["total"] / items_per_page))
+    num_pages = int(math.ceil(req.get("total", 0) / float(items_per_page))) if req else 0
     if current_page < num_pages:
         view.add_item(
             {
@@ -231,15 +238,24 @@ def show_resume_episodes():
         view.end_of_directory()
         return False
 
+    # build listables (do not filter out zero-playhead items to match ATV behavior)
+    raw_items = req.get('data') or []
+    listables = get_listables_from_response(raw_items)
+
+    if not listables:
+        view.add_item({"title": G.args.addon.getLocalizedString(30090)})
+        view.end_of_directory()
+        return False
+
     # episodes / episodes  (crunchy / xbmc)
     view.add_listables(
-        listables=get_listables_from_response(req.get('data')),
+        listables=listables,
         is_folder=False,
         options=view.OPT_CTX_SEASONS | view.OPT_CTX_EPISODES
     )
 
     # pagination
-    items_left = req.get("total") - (G.args.get_arg('offset', 0, int) * items_per_page) - len(req.get("data"))
+    items_left = (req.get("total", 0) - (G.args.get_arg('offset', 0, int) * items_per_page) - len(req.get("data") or [])) if req else 0
     if items_left > 0:
         view.add_item(
             {
@@ -375,7 +391,7 @@ def list_filter():
         options=view.OPT_CTX_WATCHLIST | view.OPT_MARK_ON_WATCHLIST | view.OPT_CTX_SEASONS | view.OPT_CTX_EPISODES
     )
 
-    items_left = req.get('total') - G.args.get_arg('offset', 0, int) - len(req.get('items'))
+    items_left = (req.get('total', 0) - G.args.get_arg('offset', 0, int) - len(req.get('items') or [])) if req else 0
 
     # show next page button
     if items_left > 0:

@@ -31,10 +31,16 @@ from .model import CrunchyrollError, ListableItem, EpisodeData, MovieData, Serie
 # @todo we could change the return type and along with the listables return additional data that we preload
 #       like info what is on watchlist, artwork, playhead, ...
 #       for that we should use async requests (asyncio)
-def get_listables_from_response(data: List[dict]) -> List[ListableItem]:
-    """ takes an API response object, determines type of its contents and creates DTOs for further processing """
+def get_listables_from_response(data: Optional[List[dict]]) -> List[ListableItem]:
+    """ takes an API response object, determines type of its contents and creates DTOs for further processing
+    Safely handles None or unexpected input by returning an empty list.
+    """
 
-    listable_items = []
+    listable_items: List[ListableItem] = []
+
+    if not data or not isinstance(data, list):
+        # Guard against None or unexpected shapes
+        return listable_items
 
     for item in data:
         # fetch type, which is always somewhere else, depending on api endpoint *sighs*

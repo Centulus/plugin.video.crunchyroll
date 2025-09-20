@@ -47,13 +47,15 @@ class API:
     UA_ATV = ""
 
     # Authentication endpoints
-    INDEX_ENDPOINT = "https://beta-api.crunchyroll.com/index/v2"
-    PROFILE_ENDPOINT = "https://beta-api.crunchyroll.com/accounts/v1/me/profile"
+    INDEX_ENDPOINT = "https://www.crunchyroll.com/index/v2"
+    # Deprecated: old profile endpoint; use multiprofile endpoints below
+    PROFILE_ENDPOINT = "https://www.crunchyroll.com/accounts/v1/me/profile"
     TOKEN_ENDPOINT = "https://www.crunchyroll.com/auth/v1/token"
     DEVICE_CODE_ENDPOINT = "https://www.crunchyroll.com/auth/v1/device/code"
     DEVICE_TOKEN_ENDPOINT = "https://www.crunchyroll.com/auth/v1/device/token"
     # Content and search endpoints
-    SEARCH_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/search"
+    # Discover/Search
+    SEARCH_ENDPOINT = "https://www.crunchyroll.com/content/v2/discover/search"
     
     # Playback endpoints
     STREAMS_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/videos/{}/streams"
@@ -68,9 +70,9 @@ class API:
     OBJECTS_BY_ID_LIST_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/cms/objects/{}"
     # SIMILAR_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/{}/similar_to"
     # NEWSFEED_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/news_feed"
-    BROWSE_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/browse"
+    BROWSE_ENDPOINT = "https://www.crunchyroll.com/content/v2/discover/browse"
     # there is also a v2, but that will only deliver content_ids and no details about the entries
-    WATCHLIST_LIST_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/{}/watchlist"
+    WATCHLIST_LIST_ENDPOINT = "https://www.crunchyroll.com/content/v2/discover/{}/watchlist"
     # only v2 will allow removal of watchlist entries.
     # !!!! be super careful and always provide a content_id, or it will delete the whole playlist! *sighs* !!!!
     # WATCHLIST_REMOVE_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/watchlist/{}"
@@ -78,8 +80,8 @@ class API:
     PLAYHEADS_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/playheads"
     # Android TV clients post playheads to the www host
     PLAYHEADS_ENDPOINT_WWW = "https://www.crunchyroll.com/content/v2/{}/playheads"
-    HISTORY_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/{}/watch-history"
-    RESUME_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/discover/{}/history"
+    HISTORY_ENDPOINT = "https://www.crunchyroll.com/content/v2/{}/watch-history"
+    RESUME_ENDPOINT = "https://www.crunchyroll.com/content/v2/discover/{}/history"
     SEASONAL_TAGS_ENDPOINT = "https://beta-api.crunchyroll.com/content/v2/discover/seasonal_tags"
     CATEGORIES_ENDPOINT = "https://beta-api.crunchyroll.com/content/v1/tenant_categories"
     SKIP_EVENTS_ENDPOINT = "https://static.crunchyroll.com/skip-events/production/{}.json"  # request w/o auth req.
@@ -99,7 +101,9 @@ class API:
     # DRM endpoints
     LICENSE_ENDPOINT = "https://cr-license-proxy.prd.crunchyrollsvc.com/v1/license/widevine"
 
-    PROFILES_LIST_ENDPOINT = "https://beta-api.crunchyroll.com/accounts/v1/me/multiprofile"
+    # Multiprofile
+    PROFILES_LIST_ENDPOINT = "https://www.crunchyroll.com/accounts/v1/{}/multiprofile"
+    PROFILE_BY_ID_ENDPOINT = "https://www.crunchyroll.com/accounts/v1/{}/multiprofile/{}"
     STATIC_IMG_PROFILE = "https://static.crunchyroll.com/assets/avatar/170x170/"
     STATIC_WALLPAPER_PROFILE = "https://static.crunchyroll.com/assets/wallpaper/720x180/"
 
@@ -118,6 +122,7 @@ class API:
         self.DEVICE_CLIENT_SECRET: str = ""
         self.session_client: str = "unknown"  # 'device' or 'mobile'
         self.cf_cookie: str = ""
+        self.last_request: Dict = {}
         # try to load dynamic client config
         try:
             self._load_client_config()
@@ -216,12 +221,18 @@ class API:
                 "refresh_token": self.account_data.refresh_token
             }
 
-        r = self.http.request(
-            method="POST",
+        # Always use cloudscraper for token requests (CF by default)
+        scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+        r = scraper.post(
             url=API.TOKEN_ENDPOINT,
             headers=headers,
-            data=data
+            data=data,
+            timeout=20
         )
+        try:
+            self._update_cookie_from_scraper(scraper)
+        except Exception:
+            pass
 
         # if refreshing and refresh token is expired, it will throw a 400
         # clear session data and let caller handle re-authentication
@@ -242,16 +253,8 @@ class API:
             return
 
         if r.status_code == 403:
-            utils.crunchy_log("Possible cloudflare shenanigans")
-            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': self.CRUNCHYROLL_UA})
-            r = scraper.post(
-                url=API.TOKEN_ENDPOINT,
-                headers=headers,
-                data=data
-            )
-
-            if 'access_token' not in r.text:
-                raise LoginError("Failed to bypass cloudflare")
+            utils.crunchy_log("Cloudflare blocked token request", xbmc.LOGERROR)
+            raise LoginError("Failed to bypass cloudflare")
 
         r_json = get_json_from_response(r)
 
@@ -262,7 +265,7 @@ class API:
             # fetch all profiles from API
             r = self.make_request(
                 method="GET",
-                url=self.PROFILES_LIST_ENDPOINT,
+                url=self.PROFILES_LIST_ENDPOINT.format(self.account_data.account_id),
             )
 
             # Extract current profile data as dict from ProfileData obj
@@ -459,11 +462,41 @@ class API:
         )
         account_data.update(r)
 
-        r = self.make_request(
-            method="GET",
-            url=API.PROFILE_ENDPOINT
-        )
-        account_data.update(r)
+        # Fetch profiles via multiprofile list on www host and select the active profile
+        try:
+            profiles_resp = self.make_request(
+                method="GET",
+                url=API.PROFILES_LIST_ENDPOINT.format(account_data.get("account_id"))
+            )
+            if profiles_resp and profiles_resp.get("profiles"):
+                # Pick selected profile or the first
+                profiles = profiles_resp.get("profiles")
+                selected = next((p for p in profiles if p.get("is_selected")), profiles[0])
+                # Also fetch full profile-by-id to get extra fields if available
+                try:
+                    profile_full = self.make_request(
+                        method="GET",
+                        url=API.PROFILE_BY_ID_ENDPOINT.format(account_data.get("account_id"), selected.get("profile_id"))
+                    ) or {}
+                except Exception:
+                    profile_full = {}
+                # Merge profile info into account_data-like fields
+                merged_profile = {**selected, **profile_full}
+                account_data.update({
+                    "preferred_communication_language": merged_profile.get("preferred_communication_language"),
+                    "preferred_content_audio_language": merged_profile.get("preferred_content_audio_language"),
+                    "preferred_content_subtitle_language": merged_profile.get("preferred_content_subtitle_language"),
+                    "maturity_rating": merged_profile.get("maturity_rating"),
+                    "username": merged_profile.get("username"),
+                    "email": merged_profile.get("email"),
+                    "avatar": merged_profile.get("avatar"),
+                })
+                # Persist ProfileData separately
+                from .model import ProfileData as _ProfileData
+                self.profile_data = _ProfileData(merged_profile)
+                self.profile_data.write_to_storage()
+        except Exception:
+            pass
 
         self.account_data = AccountData(account_data)
         self.account_data.write_to_storage()
@@ -493,7 +526,7 @@ class API:
             params = dict()
         if headers is None:
             headers = dict()
-        if self.account_data and "playback/v2" not in url:
+        if self.account_data and ("/cms/" in url):
             if expiration := self.account_data.expires:
                 current_time = get_date()
                 if current_time > str_to_date(expiration):
@@ -513,14 +546,47 @@ class API:
             request_headers["User-Agent"] = API.UA_ATV
         else:
             request_headers["User-Agent"] = API.CRUNCHYROLL_UA
-        r = self.http.request(
-            method,
-            url,
-            headers=request_headers,
-            params=params,
-            data=data,
-            json=json_data
-        )
+        # Route all www requests through cloudscraper (CF by default)
+        if url.startswith("https://www.crunchyroll.com"):
+            try:
+                scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+                if getattr(self, 'cf_cookie', None):
+                    request_headers["Cookie"] = self.cf_cookie
+                r = scraper.request(
+                    method=method,
+                    url=url,
+                    headers=request_headers,
+                    params=params,
+                    data=data if json_data is None else None,
+                    json=json_data,
+                    timeout=20
+                )
+                try:
+                    self._update_cookie_from_scraper(scraper)
+                except Exception:
+                    pass
+            except requests.exceptions.RequestException as _e:
+                raise CrunchyrollError(f"Request failed: {_e}")
+        else:
+            r = self.http.request(
+                method,
+                url,
+                headers=request_headers,
+                params=params,
+                data=data,
+                json=json_data
+            )
+
+        # record last request info for debugging
+        try:
+            self.last_request = {
+                'method': method,
+                'url': url,
+                'status': r.status_code,
+                'error': None if r.ok else r.reason
+            }
+        except Exception:
+            pass
 
         # something went wrong with authentication, possibly an expired token that wasn't caught above due to host
         # clock issues. set expiration date to 0 and re-call, triggering a full session refresh.
@@ -553,6 +619,15 @@ class API:
                 params=params,
                 timeout=20
             )
+            try:
+                self.last_request = {
+                    'method': 'GET',
+                    'url': API.STREAMS_ENDPOINT_DRM.format(episode_id),
+                    'status': r.status_code,
+                    'error': None if r.ok else r.reason
+                }
+            except Exception:
+                pass
             if r.ok:
                 self._update_cookie_from_scraper(scraper)
                 return r.json()
@@ -681,12 +756,14 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
 
     if "error" in r_json:
         error_code = r_json.get("error")
+        # only password grant failures should surface as LoginError here
         if error_code == "invalid_grant":
             raise LoginError(f"[{code}] Invalid login credentials.")
     elif "message" in r_json and "code" in r_json:
         message = r_json.get("message")
         raise CrunchyrollError(f"[{code}] Error occurred: {message}")
     if not r.ok:
+        # do not map general errors to LoginError here; callers decide based on status
         raise CrunchyrollError(f"[{code}] {r.text}")
 
     return r_json

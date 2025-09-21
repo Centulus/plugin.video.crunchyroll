@@ -18,7 +18,7 @@ import json
 import re
 import sys
 from abc import abstractmethod
-from typing import Any, Dict, Union
+from typing import Any, Dict, Union, Optional
 
 import xbmcgui
 import xbmcvfs
@@ -241,15 +241,15 @@ class ListableItem(Object):
     def __init__(self):
         super().__init__()
         # just a very few that all child classes have in common, so I can spare myself of using hasattr() and getattr()
-        self.id: str | None = None
-        self.series_id: str | None = None  # @todo: this is not present in all subclasses, move that
-        self.season_id: str | None = None  # @todo: this is not present in all subclasses, move that
-        self.title: str | None = None
-        self.title_unformatted: str | None = None
-        self.thumb: str | None = None
-        self.fanart: str | None = None
-        self.poster: str | None = None
-        self.banner: str | None = None
+        self.id: Optional[str] = None
+        self.series_id: Optional[str] = None  # @todo: this is not present in all subclasses, move that
+        self.season_id: Optional[str] = None  # @todo: this is not present in all subclasses, move that
+        self.title: Optional[str] = None
+        self.title_unformatted: Optional[str] = None
+        self.thumb: Optional[str] = None
+        self.fanart: Optional[str] = None
+        self.poster: Optional[str] = None
+        self.banner: Optional[str] = None
 
     @abstractmethod
     def get_info(self) -> Dict:
@@ -356,8 +356,8 @@ class SeriesData(ListableItem):
         self.title: str = panel.get("title")
         self.title_unformatted: str = panel.get("title")
         self.tvshowtitle: str = panel.get("title")
-        self.series_id: str | None = panel.get("id")
-        self.season_id: str | None = None
+        self.series_id: Optional[str] = panel.get("id")
+        self.season_id: Optional[str] = None
         self.plot: str = panel.get("description", "")
         self.plotoutline: str = panel.get("description", "")
         self.year: str = str(meta.get("series_launch_year")) + '-01-01'
@@ -366,10 +366,10 @@ class SeriesData(ListableItem):
         self.episode: int = meta.get('episode_count')
         self.season: int = meta.get('season_count')
 
-        self.thumb: str | None = utils.get_img_from_struct(panel, "poster_tall", 2)
-        self.fanart: str | None = utils.get_img_from_struct(panel, "poster_wide", 2)
-        self.poster: str | None = utils.get_img_from_struct(panel, "poster_tall", 2)
-        self.banner: str | None = None
+        self.thumb: Optional[str] = utils.get_img_from_struct(panel, "poster_tall", 2)
+        self.fanart: Optional[str] = utils.get_img_from_struct(panel, "poster_wide", 2)
+        self.poster: Optional[str] = utils.get_img_from_struct(panel, "poster_tall", 2)
+        self.banner: Optional[str] = None
         self.rating: int = 0
         self.playcount: int = 0
 
@@ -414,8 +414,8 @@ class SeasonData(ListableItem):
         self.title: str = data.get("title")
         self.title_unformatted: str = data.get("title")
         self.tvshowtitle: str = data.get("title")
-        self.series_id: str | None = data.get("series_id")
-        self.season_id: str | None = data.get("id")
+        self.series_id: Optional[str] = data.get("series_id")
+        self.season_id: Optional[str] = data.get("id")
         self.plot: str = ""  # does not have description. maybe object endpoint?
         self.plotoutline: str = ""
         self.year: str = ""
@@ -423,10 +423,10 @@ class SeasonData(ListableItem):
         self.premiered: str = ""
         self.episode: int = 0  # @todo we want to display that, but it's not in the data
         self.season: int = data.get('season_number')
-        self.thumb: str | None = None
-        self.fanart: str | None = None
-        self.poster: str | None = None
-        self.banner: str | None = None
+        self.thumb: Optional[str] = None
+        self.fanart: Optional[str] = None
+        self.poster: Optional[str] = None
+        self.banner: Optional[str] = None
         self.rating: int = 0
         self.playcount: int = 1 if data.get('is_complete') == 'true' else 0
 
@@ -482,21 +482,21 @@ class EpisodeData(PlayableItem):
         self.playhead: int = data.get("playhead", 0)
         self.season: int = meta.get("season_number", 1)
         self.episode: int = meta.get("episode_number", 1)
-        self.episode_id: str | None = panel.get("id")
-        self.season_id: str | None = meta.get("season_id")
-        self.series_id: str | None = meta.get("series_id")
+        self.episode_id: Optional[str] = panel.get("id")
+        self.season_id: Optional[str] = meta.get("season_id")
+        self.series_id: Optional[str] = meta.get("series_id")
         self.plot: str = panel.get("description", "")
         self.plotoutline: str = panel.get("description", "")
         self.year: str = meta.get("episode_air_date")[:4] if meta.get("episode_air_date") is not None else ""
         self.aired: str = meta.get("episode_air_date")[:10] if meta.get("episode_air_date") is not None else ""
         self.premiered: str = meta.get("episode_air_date")[:10] if meta.get("episode_air_date") is not None else ""
-        self.thumb: str | None = utils.get_img_from_struct(panel, "thumbnail", 2)
-        self.fanart: str | None = utils.get_img_from_struct(panel, "thumbnail", 2)
-        self.poster: str | None = None
-        self.banner: str | None = None
+        self.thumb: Optional[str] = utils.get_img_from_struct(panel, "thumbnail", 2)
+        self.fanart: Optional[str] = utils.get_img_from_struct(panel, "thumbnail", 2)
+        self.poster: Optional[str] = None
+        self.banner: Optional[str] = None
         self.rating: int = 0
         self.playcount: int = 0
-        self.stream_id: str | None = utils.get_stream_id_from_item(panel)
+        self.stream_id: Optional[str] = utils.get_stream_id_from_item(panel)
 
         self.recalc_playcount()
 
@@ -551,9 +551,9 @@ class MovieData(PlayableItem):
         self.playhead: int = data.get("playhead", 0)
         self.season: int = 1
         self.episode: int = 1
-        self.episode_id: str | None = panel.get("id")
-        self.season_id: str | None = None
-        self.series_id: str | None = None
+        self.episode_id: Optional[str] = panel.get("id")
+        self.season_id: Optional[str] = None
+        self.series_id: Optional[str] = None
         self.plot: str = panel.get("description", "")
         self.plotoutline: str = panel.get("description", "")
         self.year: str = meta.get("premium_available_date")[:10] if meta.get(
@@ -562,13 +562,13 @@ class MovieData(PlayableItem):
             "premium_available_date") is not None else ""
         self.premiered: str = meta.get("premium_available_date")[:10] if meta.get(
             "premium_available_date") is not None else ""
-        self.thumb: str | None = utils.get_img_from_struct(panel, "thumbnail", 2)
-        self.fanart: str | None = utils.get_img_from_struct(panel, "thumbnail", 2)
-        self.poster: str | None = None
-        self.banner: str | None = None
+        self.thumb: Optional[str] = utils.get_img_from_struct(panel, "thumbnail", 2)
+        self.fanart: Optional[str] = utils.get_img_from_struct(panel, "thumbnail", 2)
+        self.poster: Optional[str] = None
+        self.banner: Optional[str] = None
         self.rating: int = 0
         self.playcount: int = 0
-        self.stream_id: str | None = utils.get_stream_id_from_item(panel)
+        self.stream_id: Optional[str] = utils.get_stream_id_from_item(panel)
 
         self.recalc_playcount()
 

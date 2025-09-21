@@ -133,7 +133,7 @@ def find_route_matching_args(args: dict) -> Optional[str]:
     }
     # Choose the best one by looking for the largest parameter count
     param_number: int = 0
-    selected_route: str | None = None
+    selected_route: Optional[str] = None
     for route, params in filtered_params.items():
         if len(params) > param_number:
             param_number = len(params)

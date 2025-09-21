@@ -41,15 +41,21 @@ class CrunchyPlayer(xbmc.Player):
         try:
             utils.crunchy_log("onAVStarted: playback started", xbmc.LOGINFO)
             self._parent._on_started()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                utils.crunchy_log(f"onAVStarted handler error: {e}", xbmc.LOGERROR)
+            except Exception:
+                pass
 
     def onPlayBackStarted(self):
         try:
             utils.crunchy_log("onPlayBackStarted: playback started", xbmc.LOGINFO)
             self._parent._on_started()
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                utils.crunchy_log(f"onPlayBackStarted handler error: {e}", xbmc.LOGERROR)
+            except Exception:
+                pass
 
     def onPlayBackSeek(self, time, seekOffset):
         try:
@@ -62,8 +68,11 @@ class CrunchyPlayer(xbmc.Player):
                 new_time_secs = int(time)
             # Pass the normalized playback time to ensure reliable detection
             self._parent._on_seek(new_time_secs)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                utils.crunchy_log(f"onPlayBackSeek handler error: {e}", xbmc.LOGERROR)
+            except Exception:
+                pass
 
 class VideoPlayer(Object):
     """ Handles playing video using data contained in args object
@@ -85,6 +94,9 @@ class VideoPlayer(Object):
         self._playing_url = None  # type: Optional[str]  # actual URL Kodi is playing (may be local proxy)
         self._paused = False  # Track pause state to send one-shot update on pause
         self._last_seek_update_ts = 0.0  # Cooldown to prevent duplicate seek updates
+        # serialize playhead updates across events and loop
+        import threading as _threading
+        self._playhead_lock = _threading.Lock()
 
     def start_playback(self):
         """ Set up player and start playback """
@@ -153,10 +165,11 @@ class VideoPlayer(Object):
                 if hasattr(self, '_local_server') and self._local_server:
                     self._local_server.shutdown()
                     self._local_server.server_close()
-                    self._local_server = None
                 if hasattr(self, '_server_thread') and self._server_thread:
-                    self._server_thread.join(timeout=1.0)
-                    self._server_thread = None
+                    # give a bit more time to exit cleanly
+                    self._server_thread.join(timeout=2.0)
+                self._local_server = None
+                self._server_thread = None
             except Exception:
                 pass
 
@@ -202,15 +215,15 @@ class VideoPlayer(Object):
         #       wanted data - like playhead - we need to copy over that information to the PlayableItem before
         #        converting it to a kodi item. be aware of this.
 
-        # copy playhead to PlayableItem (if resume is true on argv[3]) - this is required for resume capability
-        if (
-                self._stream_data.playable_item.playhead == 0
-                and self._stream_data.playheads_data.get(G.args.get_arg('episode_id'), {})
-                and G.args.argv[3] == 'resume:true'
-        ):
-            self._stream_data.playable_item.update_playcount_from_playhead(
-                self._stream_data.playheads_data.get(G.args.get_arg('episode_id'))
-            )
+        # copy playhead to PlayableItem when available (do not depend on argv[3])
+        try:
+            ep_id = G.args.get_arg('episode_id')
+            if ep_id and self._stream_data.playheads_data.get(ep_id):
+                self._stream_data.playable_item.update_playcount_from_playhead(
+                    self._stream_data.playheads_data.get(ep_id)
+                )
+        except Exception:
+            pass
 
         item = self._stream_data.playable_item.to_item()
         # Track the (initial) playing URL. Might change to local proxy later.
@@ -269,6 +282,24 @@ class VideoPlayer(Object):
         if self._stream_data.subtitle_urls:
             item.setSubtitles(self._stream_data.subtitle_urls)
 
+        # Apply resume to the resolved item when playhead is present
+        try:
+            playhead = int(float(getattr(self._stream_data.playable_item, 'playhead', 0)) or 0)
+            if playhead > 0:
+                safe = self._safe_playhead(playhead)
+                # Set StartOffset for the player to start at position
+                item.setProperty('StartOffset', str(safe))
+                # Also set InfoTag resume point for clients reading JSON (e.g., Yatse)
+                try:
+                    tag = item.getVideoInfoTag()
+                    duration = int(float(getattr(self._stream_data.playable_item, 'duration', 0)) or 0)
+                    if duration > 0 and safe >= 10 and safe <= int(duration * 0.95):
+                        tag.setResumePoint(safe, duration)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         """ start playback"""
         xbmcplugin.setResolvedUrl(int(G.args.argv[1]), True, item)
 
@@ -295,9 +326,9 @@ class VideoPlayer(Object):
             import http.server
             import socketserver
             from ..modules import cloudscraper
-            
-            # Fetch MPD via cloudscraper
-            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': 'okhttp/4.12.0'})
+
+            # Fetch MPD via cloudscraper (shorter delay to reduce blocking)
+            scraper = cloudscraper.create_scraper(delay=5, browser={'custom': 'okhttp/4.12.0'})
             resp = scraper.get(self._stream_data.stream_url, headers=manifest_headers, timeout=15)
             utils.crunchy_log(f"MPD fetch via cloudscraper: {resp.status_code}")
             
@@ -319,8 +350,12 @@ class VideoPlayer(Object):
                     def log_message(self, format, *args):
                         pass  # Suppress HTTP server logs
                 
-                # Start local HTTP server
-                httpd = socketserver.TCPServer(("127.0.0.1", 0), MPDHandler)
+                # Start local HTTP server (threading, allow quick reuse)
+                class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+                    daemon_threads = True
+                    allow_reuse_address = True
+
+                httpd = ThreadingTCPServer(("127.0.0.1", 0), MPDHandler)
                 port = httpd.server_address[1]
                 local_url = f"http://127.0.0.1:{port}/manifest.mpd"
                 
@@ -359,10 +394,12 @@ class VideoPlayer(Object):
             utils.crunchy_log(f"{label} below 10s -> skip send ({safe}s)", xbmc.LOGDEBUG)
             return
         utils.crunchy_log(f"{label} at {safe}", xbmc.LOGINFO)
-        update_playhead(G.args.get_arg('episode_id'), safe)
-        self.lastUpdatePlayhead = safe
-        self.lastKnownTime = safe
-        self.wasPlaying = True
+        # prevent overlapping updates; network can be slow
+        with self._playhead_lock:
+            update_playhead(G.args.get_arg('episode_id'), safe)
+            self.lastUpdatePlayhead = safe
+            self.lastKnownTime = safe
+            self.wasPlaying = True
 
     def is_paused(self) -> bool:
         try:
@@ -521,13 +558,29 @@ class VideoPlayer(Object):
         # show only for the first X seconds
         dialog_duration = min(dialog_duration, self._skip_modal_duration_max)
 
-        show_modal_dialog(SkipModalDialog, "plugin-video-crunchyroll-skip.xml", **{
-            'seconds': dialog_duration,
-            'seek_time': self._stream_data.skip_events_data.get(section).get('end'),
-            'label': G.args.addon.getLocalizedString(30015),
-            'addon_path': G.args.addon.getAddonInfo("path"),
-            'content_id': G.args.get_arg('episode_id'),
-        })
+        # Open the dedicated skip dialog window and let it perform the seek
+        try:
+            dlg = SkipModalDialog('plugin-video-crunchyroll-skip.xml',
+                                   G.args.addon.getAddonInfo('path'),
+                                   'default', '1080i',
+                                   seek_time=self._stream_data.skip_events_data.get(section).get('end'),
+                                   content_id=G.args.get_arg('episode_id'),
+                                   label=G.args.addon.getLocalizedString(30015))
+            dlg.show()
+            # Keep it visible only for a bounded duration
+            t0 = time.time()
+            while dlg and (time.time() - t0) < max(1, int(dialog_duration)):
+                xbmc.sleep(100)
+                # If user pressed the button, the dialog will close itself
+                if not dlg.isVisible():
+                    break
+            try:
+                dlg.close()
+            except Exception:
+                pass
+        except Exception:
+            # Fallback: direct instaskip if dialog fails
+            self._instaskip(section)
 
     def _instaskip(self, section):
         """ Skip immediatly without asking """
@@ -545,40 +598,74 @@ class VideoPlayer(Object):
         if not G.args.get_arg('episode_id') or not self._stream_data.token:
             return
 
-        try:
-            token = token or self._stream_data.token
+        token = token or self._stream_data.token
+        # try a couple of times with small backoff; network can be flaky
+        for attempt in range(2):
+            try:
+                G.api.make_request(
+                    method="DELETE",
+                    url=G.api.STREAMS_ENDPOINT_CLEAR_STREAM.format(G.args.get_arg('episode_id'), token),
+                    timeout=10
+                )
+                utils.crunchy_log("Cleared active stream for episode: %s" % G.args.get_arg('episode_id'))
+                return
+            except (CrunchyrollError, LoginError, requests.exceptions.RequestException) as _e:
+                if attempt == 0:
+                    try:
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                else:
+                    utils.crunchy_log("Failed to clear active stream for episode: %s" % G.args.get_arg('episode_id'))
+                    return
 
-            G.api.make_request(
-                method="DELETE",
-                url=G.api.STREAMS_ENDPOINT_CLEAR_STREAM.format(G.args.get_arg('episode_id'), token),
-            )
-        except (CrunchyrollError, LoginError, requests.exceptions.RequestException):
-            # catch timeout or any other possible exception
-            utils.crunchy_log("Failed to clear active stream for episode: %s" % G.args.get_arg('episode_id'))
-            return
-
-        utils.crunchy_log("Cleared active stream for episode: %s" % G.args.get_arg('episode_id'))
 
     def get_active_streams(self) -> List[str]:
         try:
+            # This endpoint must be called with GET to list streams
             req = G.api.make_request(
-                method="DELETE",
-                url=G.api.STREAMS_ENDPOINT_GET_ACTIVE_STREAMS
+                method="GET",
+                url=G.api.STREAMS_ENDPOINT_GET_ACTIVE_STREAMS,
+                timeout=10
             )
         except (CrunchyrollError, LoginError, requests.exceptions.RequestException):
             # catch timeout or any other possible exception
             utils.crunchy_log("Failed to get active streams")
-            return
+            return []
 
-        active = []
-
+        active: List[str] = []
         if not req:
             return active
 
-        for item in req:
-            if item.get('deviceId') != G.args.device_id:
+        # Normalize response to a list of session dicts
+        items = []
+        if isinstance(req, list):
+            # If it's a list of tokens already, return them directly
+            if all(isinstance(x, str) for x in req):
+                return list(req)
+            items = req
+        elif isinstance(req, dict):
+            for key in ("sessions", "items", "data", "streams", "result"):
+                val = req.get(key)
+                if isinstance(val, list):
+                    items = val
+                    break
+            if not items:
+                # Some backends may return a single object
+                items = [req]
+
+        # Filter by this device when device_id is available; otherwise collect all tokens
+        current_device = getattr(G.args, 'device_id', None)
+        for entry in items:
+            if not isinstance(entry, dict):
                 continue
-            active.append(item.get('token'))
+            device_id = entry.get('deviceId') or entry.get('device_id')
+            token = entry.get('token') or entry.get('video_token') or entry.get('stream_token')
+            if not token:
+                continue
+            if current_device and device_id and device_id != current_device:
+                continue
+            active.append(token)
 
         return active
 

@@ -17,6 +17,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import random
+import secrets
 import re
 
 import xbmc
@@ -48,16 +49,13 @@ def main(argv):
     # remove legacy credential gating; we no longer use username/password
     G.args._device_id = G.args.addon.getSetting("device_id")
     if not G.args.device_id:
-        char_set = "0123456789abcdefghijklmnopqrstuvwxyz0123456789"
-        G.args._device_id = (
-                "".join(random.sample(char_set, 8)) +
-                "-KODI-" +
-                "".join(random.sample(char_set, 4)) +
-                "-" +
-                "".join(random.sample(char_set, 4)) +
-                "-" +
-                "".join(random.sample(char_set, 12))
-        )
+        # Generate a stable but hard-to-guess device id.
+        # Keep a readable pattern while using cryptographically secure randomness.
+        def _rand(n: int) -> str:
+            alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+            return "".join(secrets.choice(alphabet) for _ in range(n))
+
+        G.args._device_id = f"{_rand(8)}-KODI-{_rand(4)}-{_rand(4)}-{_rand(12)}"
         G.args.addon.setSetting("device_id", G.args.device_id)
 
     # get subtitle language
@@ -77,6 +75,12 @@ def main(argv):
     # login/session init
     try:
         G.api.start()
+        
+        # If we're explicitly navigating to the retry screen, do not start device-code login again.
+        # Render the retry listing instead.
+        requested_mode = G.args.get_arg('mode')
+        if requested_mode == 'activation_retry' and not G.api.account_data.access_token:
+            return check_mode()
         
         if not G.api.account_data.access_token:
             # Hybrid auth: try username/password first (mobile client), then fallback to device-code.
@@ -102,12 +106,7 @@ def main(argv):
                 G.api.init_cf_cookie()
                 G.api.acquire_anonymous_token()
 
-                # Clear/replace the current listing with an empty one before showing the modal dialog,
-                # so nothing remains visible behind the overlay.
-                try:
-                    view.end_of_directory(update_listing=True, cache_to_disc=False)
-                except Exception:
-                    pass
+                # Keep the container open; we'll render the retry listing later in this invocation.
 
                 device = G.api.request_device_code()
                 if not device:
@@ -126,44 +125,182 @@ def main(argv):
                                         expires_in=expires_in, interval_ms=interval_ms,
                                         device_code=device_code, api_instance=G.api)
                 dialog.show()
+                xbmc.log("[Crunchyroll] Activation dialog shown", xbmc.LOGINFO)
 
                 import time as _t
                 start_ts = _t.time()
+                expirations = 0  # count consecutive expirations
                 user_cancelled = False
+                show_retry_listing = False  # after 3 expirations, return to empty menu with a Retry folder
                 try:
-                    while _t.time() - start_ts < expires_in:
-                        # Stop polling if user closed the dialog
-                        if hasattr(dialog, 'is_running') and not dialog.is_running:
+                    # Loop until user authenticates or cancels; expiry handled here (no GUI ops from timer)
+                    while True:
+                        # 1) If user canceled (Back), exit immediately; do not reopen or regenerate
+                        if getattr(dialog, 'canceled', False):
                             user_cancelled = True
                             break
 
-                        # Use the current device_code from dialog (might be updated if regenerated)
-                        current_device_code = dialog.device_code if hasattr(dialog, 'device_code') else device_code
-                        token = G.api.poll_device_token(current_device_code)
+                        # 2) Handle expiry (timer sets flag and stops)
+                        if getattr(dialog, 'expired', False):
+                            try:
+                                expirations += 1
+                                if expirations >= 3:
+                                    # After 3 timeouts, stop here and return to an empty listing with a Retry folder.
+                                    show_retry_listing = True
+                                    # ensure timer is stopped and exit loop to render listing
+                                    try:
+                                        if hasattr(dialog, 'stop_timer'):
+                                            dialog.stop_timer()
+                                    except Exception:
+                                        pass
+                                    break
+                                else:
+                                    xbmc.log("[Crunchyroll] Activation expired - regenerating code (main loop)", xbmc.LOGINFO)
+                                
+                                # Request/refresh device_code when either <3 expirations or after Retry
+                                device = G.api.request_device_code()
+                                if device:
+                                    user_code = device.get("user_code", "------").upper()
+                                    device_code = device.get("device_code")
+                                    interval_ms = int(device.get("interval", 500))
+                                    expires_in = int(device.get("expires_in", 300))
+                                    qr_url = f"https://crunchyroll.com/activate?code={user_code}&device=Android%20TV"
+
+                                    # Update dialog and restart timer
+                                    try:
+                                        dialog.update_activation(user_code, device_code, expires_in, interval_ms, qr_url)
+                                    except Exception:
+                                        pass
+                                    dialog.start_timer()
+                                    start_ts = _t.time()
+                                    continue
+                                else:
+                                    xbmcgui.Dialog().notification(G.args.addon_name, 'Activation expired. Please try again.', xbmcgui.NOTIFICATION_INFO, 5)
+                                    try:
+                                        if hasattr(dialog, 'stop_timer'):
+                                            dialog.stop_timer()
+                                        dialog.close()
+                                    except Exception:
+                                        pass
+                                    return False
+                            except Exception:
+                                pass
+
+                        # 3) If dialog stopped running and not due to expiry/cancel, try to recover by reopening it
+                        if (not getattr(dialog, 'is_running', True)
+                                and not getattr(dialog, 'expired', False)
+                                and not getattr(dialog, 'canceled', False)):
+                            xbmc.log("[Crunchyroll] Activation dialog closed unexpectedly - reopening", xbmc.LOGWARNING)
+                            try:
+                                # Ensure any timer from old instance is stopped
+                                if hasattr(dialog, 'stop_timer'):
+                                    dialog.stop_timer()
+                            except Exception:
+                                pass
+                            try:
+                                # Re-create dialog with current activation data
+                                info_text = f"1. Go to https://crunchyroll.com/activate\n2. Enter code: {user_code}\n3. Or scan the QR code below"
+                                dialog = ActivationDialog('plugin-video-crunchyroll-activation.xml', G.args.addon.getAddonInfo('path'), 'default', '1080i',
+                                                         code=user_code, qr_url=qr_url, info=info_text,
+                                                         expires_in=expires_in, interval_ms=interval_ms,
+                                                         device_code=device_code, api_instance=G.api)
+                                dialog.show()
+                                dialog.start_timer()
+                                xbmc.log("[Crunchyroll] Activation dialog re-opened", xbmc.LOGINFO)
+                                # Small delay to let UI settle
+                                _t.sleep(0.1)
+                                continue
+                            except Exception as _re_err:
+                                xbmc.log(f"[Crunchyroll] Failed to reopen activation dialog: {_re_err}", xbmc.LOGERROR)
+                                user_cancelled = True
+                                break
+
+                        # Use the current device_code from dialog (may be updated after regen)
+                        current_device_code = getattr(dialog, 'device_code', device_code)
+                        # No inactive/pause mode; proceed to poll
+                        token = None
+                        try:
+                            token = G.api.poll_device_token(current_device_code)
+                        except Exception as _poll_err:
+                            xbmc.log(f"[Crunchyroll] Poll error (ignored): {_poll_err}", xbmc.LOGWARNING)
+                            # brief wait to avoid tight loop in case of repeated errors
+                            _monitor = xbmc.Monitor()
+                            if _monitor.waitForAbort(0.25):
+                                user_cancelled = True
+                                break
                         if token and token.get('access_token'):
                             # finalize session then reload addon root to render fresh UI
                             G.api._finalize_session_from_token_response(token)
+                            # Ensure dialog thread is stopped and dialog is closed before returning
+                            try:
+                                if hasattr(dialog, 'stop_timer'):
+                                    dialog.stop_timer()
+                                dialog.close()
+                            except Exception:
+                                pass
                             try:
                                 xbmc.executebuiltin(f"Container.Update({G.args.addonurl}, replace)")
                             except Exception:
                                 pass
                             return True
                         # Use the dialog's current interval if it was regenerated, else fallback to the initial one
+                        # Use abort-aware wait instead of blocking sleep to keep UI responsive
                         sleep_ms = getattr(dialog, 'interval_ms', interval_ms)
-                        xbmc.sleep(max(1, int(sleep_ms)))
-                    else:
-                        # expired; close and inform
-                        xbmcgui.Dialog().notification(G.args.addon_name, 'Activation expired. Please try again.', xbmcgui.NOTIFICATION_INFO, 5)
+                        _monitor = xbmc.Monitor()
+                        if _monitor.waitForAbort(max(0.001, float(sleep_ms) / 1000.0)):
+                            # Abort requested by Kodi (shutdown); exit cleanly
+                            user_cancelled = True
+                            break
                 finally:
                     try:
-                        dialog.is_running = False  # Stop timer thread
-                        dialog.close()
+                        # Safe thread shutdown to prevent PyTuple_Resize crashes
+                        if hasattr(dialog, 'stop_timer'):
+                            dialog.stop_timer(timeout=5.0)  # Longer timeout for safety
+                        
+                        # Close dialog safely
+                        if hasattr(dialog, 'close'):
+                            dialog.close()
+                    except Exception as cleanup_error:
+                        # Log cleanup errors but don't propagate them
+                        try:
+                            xbmc.log(f"[Crunchyroll] Dialog cleanup error: {cleanup_error}", xbmc.LOGWARNING)
+                        except Exception:
+                            pass  # Even logging can fail during shutdown
+
+                # If we decided to show the retry listing, render it now and stop.
+                if show_retry_listing and not G.api.account_data.access_token:
+                    # Render the listing directly to avoid re-triggering activation flow
+                    try:
+                        handle = int(G.args.argv[1])
+                        try:
+                            xbmcplugin.setContent(handle, "files")
+                        except Exception:
+                            pass
+                        li = xbmcgui.ListItem(label="Retry activation")
+                        try:
+                            li.setLabel2("Restart activation and get a new code")
+                        except Exception:
+                            pass
+                        try:
+                            li.setInfo('video', {'plot': 'Restart the activation flow to get a new QR code and activation code.'})
+                        except Exception:
+                            pass
+                        # Clicking this non-folder item will run the plugin; handler will update the container to root
+                        url = f"{G.args.addonurl}?mode=activation_retry_start"
+                        # Non-folder item prevents Kodi auto-enter and ensures visibility
+                        xbmcplugin.addDirectoryItem(handle=handle, url=url, listitem=li, isFolder=False, totalItems=1)
+                        xbmcplugin.addSortMethod(handle, xbmcplugin.SORT_METHOD_NONE)
+                        xbmcplugin.endOfDirectory(handle=handle, updateListing=False, cacheToDisc=False)
                     except Exception:
                         pass
+                    return True
 
                 # If user cancelled, just exit cleanly; listing was already ended before dialog
                 if user_cancelled and not G.api.account_data.access_token:
                     return False
+            # After activation flow, ensure we don’t proceed without a valid access token
+            if not G.api.account_data.access_token:
+                return False
 
         # request to select profile if not set already
         if G.api.profile_data.profile_id is None:
@@ -261,6 +398,42 @@ def check_mode():
         controller.crunchylists_item()
     elif mode == 'profiles_list':
         controller.show_profiles()
+    elif mode == 'activation_retry':
+        # Render a simple directory with a single non-folder item to retry activation
+        try:
+            handle = int(G.args.argv[1])
+            try:
+                xbmcplugin.setContent(handle, "files")
+            except Exception:
+                pass
+            li = xbmcgui.ListItem(label="Retry activation")
+            # Brief info so users know what this does
+            try:
+                li.setLabel2("Restart activation and get a new code")
+            except Exception:
+                pass
+            try:
+                li.setInfo('video', {'plot': 'Restart the activation flow to get a new QR code and activation code.'})
+            except Exception:
+                pass
+            # Clicking this non-folder item will run the plugin; handler will update the container to root
+            url = f"{G.args.addonurl}?mode=activation_retry_start"
+            xbmcplugin.addDirectoryItem(handle=handle, url=url, listitem=li, isFolder=False, totalItems=1)
+            xbmcplugin.addSortMethod(handle, xbmcplugin.SORT_METHOD_NONE)
+            xbmcplugin.endOfDirectory(handle=handle, updateListing=False, cacheToDisc=False)
+        except Exception as _retry_err:
+            try:
+                xbmc.log(f"[Crunchyroll] Failed to render activation_retry listing: {_retry_err}", xbmc.LOGERROR)
+            except Exception:
+                pass
+        return True
+    elif mode == 'activation_retry_start':
+        # Switch the container to the addon root so the retry menu disappears, then let main() handle activation.
+        try:
+            xbmc.executebuiltin(f"Container.Update({G.args.addonurl})")
+        except Exception:
+            pass
+        return True
     else:
         # unknown mode
         utils.crunchy_log("Failed in check_mode '%s'" % str(mode), xbmc.LOGERROR)

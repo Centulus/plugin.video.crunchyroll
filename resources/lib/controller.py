@@ -36,7 +36,7 @@ def show_profiles():
     req = G.api.make_request(
         method="GET",
         url=G.api.PROFILES_LIST_ENDPOINT.format(G.api.account_data.account_id)
-    )
+        , timeout=15)
 
     # check for error
     if not req or "error" in req:
@@ -49,8 +49,9 @@ def show_profiles():
     current_profile = 0
 
     if bool(G.api.profile_data.profile_id):
-        current_profile = \
-            [i for i in range(len(profiles)) if profiles[i].get("profile_id") == G.api.profile_data.profile_id][0]
+        matches = [i for i in range(len(profiles)) if profiles[i].get("profile_id") == G.api.profile_data.profile_id]
+        if matches:
+            current_profile = matches[0]
 
     selected = xbmcgui.Dialog().select(
         G.args.addon.getLocalizedString(30073),
@@ -83,7 +84,8 @@ def show_queue():
             "n": 1024,
             "start": 0,
             "locale": G.args.subtitle
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -134,7 +136,8 @@ def search_anime():
             "locale": G.args.subtitle,
             "start": G.args.get_arg('offset', 0, int),
             "type": "top_results"
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -186,7 +189,8 @@ def show_history():
             "page_size": items_per_page,
             "page": current_page,
             "locale": G.args.subtitle,
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -229,7 +233,8 @@ def show_resume_episodes():
             "n": items_per_page,
             "locale": G.args.subtitle,
             "start": G.args.get_arg('offset', 0, int),
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -376,7 +381,7 @@ def list_filter():
         method="GET",
         url=G.api.BROWSE_ENDPOINT,
         params=params
-    )
+        , timeout=15)
 
     # check for error
     if req is None or req.get("error") is not None:
@@ -417,7 +422,8 @@ def list_filter_without_category():
         url=G.api.CATEGORIES_ENDPOINT,
         params={
             "locale": G.args.subtitle,
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -463,7 +469,8 @@ def view_season():
             "series_id": G.args.get_arg('series_id'),
             "preferred_audio_language": G.api.account_data.default_audio_language,
             "force_locale": ""
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -492,7 +499,8 @@ def view_episodes():
         params={
             "locale": G.args.subtitle,
             "season_id": G.args.get_arg('season_id')
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -545,7 +553,8 @@ def add_to_queue() -> bool:
             },
             headers={
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout=15
         )
     except CrunchyrollError as e:
         if 'content.add_watchlist_item_v2.item_already_exists' in str(e):
@@ -613,7 +622,8 @@ def crunchylists_lists():
         url=G.api.CRUNCHYLISTS_LISTS_ENDPOINT.format(G.api.account_data.account_id),
         params={
             'locale': G.args.subtitle
-        }
+        },
+        timeout=15
     )
 
     # check for error
@@ -651,7 +661,8 @@ def crunchylists_item():
                                                     G.args.get_arg('crunchylists_item_id')),
         params={
             'locale': G.args.subtitle
-        }
+        },
+        timeout=15
     )
 
     # check for error

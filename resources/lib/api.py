@@ -28,6 +28,7 @@ from requests import HTTPError, Response
 from . import utils
 from .globals import G
 from .model import AccountData, LoginError, ProfileData, CrunchyrollError
+from typing import Union
 from ..modules import cloudscraper
 
 
@@ -223,12 +224,17 @@ class API:
 
         # Always use cloudscraper for token requests (CF by default)
         scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
-        r = scraper.post(
-            url=API.TOKEN_ENDPOINT,
-            headers=headers,
-            data=data,
-            timeout=20
-        )
+        try:
+            r = scraper.post(
+                url=API.TOKEN_ENDPOINT,
+                headers=headers,
+                data=data,
+                timeout=20
+            )
+        except requests.exceptions.RequestException as e:
+            # Critical path: don't swallow auth errors, log and raise
+            utils.crunchy_log(f"Token request failed: {e}", xbmc.LOGERROR)
+            raise LoginError("Token request failed")
         try:
             self._update_cookie_from_scraper(scraper)
         except Exception:
@@ -521,6 +527,8 @@ class API:
             data=None,
             json_data=None,
             is_retry=False,
+    # Use typing.Union instead of PEP604 for Kodi Python compatibility
+    timeout: "Union[int, float]" = 20,
     ) -> Optional[Dict]:
         if params is None:
             params = dict()
@@ -559,7 +567,7 @@ class API:
                     params=params,
                     data=data if json_data is None else None,
                     json=json_data,
-                    timeout=20
+                    timeout=timeout
                 )
                 try:
                     self._update_cookie_from_scraper(scraper)
@@ -574,7 +582,8 @@ class API:
                 headers=request_headers,
                 params=params,
                 data=data,
-                json=json_data
+                json=json_data,
+                timeout=timeout
             )
 
         # record last request info for debugging
@@ -724,7 +733,7 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
     from .model import CrunchyrollError
 
     code: int = r.status_code
-    response_type: str = r.headers.get("Content-Type")
+    response_type: str = r.headers.get("Content-Type", "")
     # no content - possibly POST/DELETE request?
     if not r or not r.text:
         try:
@@ -734,8 +743,8 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
             # r.text is empty when status code cause raise
             r = e.response
 
-    # handle text/plain response (e.g. fetch subtitle)
-    if response_type == "text/plain":
+    # handle subtitle/text responses (e.g. VTT/ASS or text/plain; charset=...)
+    if response_type.startswith("text/plain") or response_type.startswith("text/vtt") or response_type.startswith("application/x-subrip"):
         # if encoding is not provided in the response, Requests will make an educated guess and very likely fail
         # messing encoding up - which did cost me hours. We will always receive utf-8 from crunchy, so enforce that
         r.encoding = "utf-8"
@@ -745,12 +754,17 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
         })
         return d
 
-    if not r.ok and r.text[0] != "{":
-        raise CrunchyrollError(f"[{code}] {r.text}")
+    if not r.ok and r.text and r.text[0] != "{":
+        # Truncate noisy HTML bodies to keep logs readable
+        body = r.text
+        max_len = 300
+        snippet = (body[:max_len] + '...') if len(body) > max_len else body
+        ctype = r.headers.get('Content-Type', '')
+        raise CrunchyrollError(f"[{code}] Non-JSON response ({ctype}): {snippet}")
 
     try:
         r_json: Dict = r.json()
-    except requests.exceptions.JSONDecodeError:
+    except Exception:
         log_error_with_trace("Failed to parse response data")
         return None
 
@@ -764,6 +778,9 @@ def get_json_from_response(r: Response) -> Optional[Dict]:
         raise CrunchyrollError(f"[{code}] Error occurred: {message}")
     if not r.ok:
         # do not map general errors to LoginError here; callers decide based on status
-        raise CrunchyrollError(f"[{code}] {r.text}")
+        body = r.text or ''
+        max_len = 300
+        snippet = (body[:max_len] + '...') if len(body) > max_len else body
+        raise CrunchyrollError(f"[{code}] {snippet}")
 
     return r_json

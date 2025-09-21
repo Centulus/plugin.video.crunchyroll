@@ -71,26 +71,34 @@ class User_Agent():
             sys.tracebacklimit = 0
             raise RuntimeError("Sorry you can't have mobile and desktop disabled at the same time.")
 
+        # If a custom UA is provided, don't load the dataset from browsers.json
+        
+        if self.custom:
+            self.cipherSuite = [
+                ssl._DEFAULT_CIPHERS,
+                '!AES128-SHA',
+                '!ECDHE-RSA-AES256-SHA',
+            ]
+            self.headers = OrderedDict([
+                ('User-Agent', self.custom),
+                ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8'),
+                ('Accept-Language', 'en-US,en;q=0.9'),
+                ('Accept-Encoding', 'gzip, deflate, br')
+            ])
+            # strip brotli below if allow_brotli is False
+            if not kwargs.get('allow_brotli', False) and 'br' in self.headers['Accept-Encoding']:
+                self.headers['Accept-Encoding'] = ','.join([
+                    encoding for encoding in self.headers['Accept-Encoding'].split(',') if encoding.strip() != 'br'
+                ]).strip()
+            return
+
         with open(os.path.join(os.path.dirname(__file__), 'browsers.json'), 'r') as fp:
             user_agents = json.load(
                 fp,
                 object_pairs_hook=OrderedDict
             )
 
-        if self.custom:
-            if not self.tryMatchCustom(user_agents):
-                self.cipherSuite = [
-                    ssl._DEFAULT_CIPHERS,
-                    '!AES128-SHA',
-                    '!ECDHE-RSA-AES256-SHA',
-                ]
-                self.headers = OrderedDict([
-                    ('User-Agent', self.custom),
-                    ('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8'),
-                    ('Accept-Language', 'en-US,en;q=0.9'),
-                    ('Accept-Encoding', 'gzip, deflate, br')
-                ])
-        else:
+        if not self.custom:
             if self.browser and self.browser not in self.browsers:
                 sys.tracebacklimit = 0
                 raise RuntimeError(f'Sorry "{self.browser}" browser is not valid, valid browsers are [{", ".join(self.browsers)}].')

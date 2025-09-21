@@ -16,6 +16,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import json
 import re
+import asyncio
 from datetime import datetime
 from json import dumps
 from typing import Dict, Union, List, Optional
@@ -76,6 +77,25 @@ def get_listables_from_response(data: Optional[List[dict]]) -> List[ListableItem
     return listable_items
 
 
+# Compatibility wrapper for asyncio.to_thread (added in Python 3.9)
+# Falls back to running the callable in the default executor on older Python versions (e.g., 3.8)
+async def aio_to_thread(func, /, *args, **kwargs):
+    """Run a blocking callable in a thread and await its result, Python 3.8+ compatible.
+
+    Uses asyncio.to_thread when available (3.9+), otherwise run_in_executor.
+    """
+    try:
+        to_thread = getattr(asyncio, "to_thread")
+    except Exception:
+        to_thread = None
+
+    if callable(to_thread):
+        return await to_thread(func, *args, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
+
+
 async def get_cms_object_data_by_ids(ids: list) -> dict:
     """ fetch info from api object endpoint for given ids. Useful to complement missing data """
 
@@ -85,14 +105,20 @@ async def get_cms_object_data_by_ids(ids: list) -> dict:
         return {}
 
     try:
-        req = G.api.make_request(
-            method='GET',
-            url=G.api.OBJECTS_BY_ID_LIST_ENDPOINT.format(','.join(ids_filtered)),
-            params={
+        # Offload blocking request into a thread to avoid freezing event loop
+        req = await aio_to_thread(
+            G.api.make_request,
+            'GET',
+            G.api.OBJECTS_BY_ID_LIST_ENDPOINT.format(','.join(ids_filtered)),
+            None,
+            {
                 'locale': G.args.subtitle,
                 'ratings': 'true'
-                # "preferred_audio_language": ""
-            }
+            },
+            None,
+            None,
+            False,
+            20
         )
     except (CrunchyrollError, requests.exceptions.RequestException):
         crunchy_log("get_cms_object_data_by_ids: failed to load for: %s" % ",".join(ids_filtered))
@@ -125,13 +151,20 @@ async def get_playheads_from_api(episode_ids: Union[str, list]) -> Dict:
     if isinstance(episode_ids, str):
         episode_ids = [episode_ids]
 
-    response = G.api.make_request(
-        method='GET',
-        url=G.api.PLAYHEADS_ENDPOINT.format(G.api.account_data.account_id),
-        params={
+    # Offload blocking request into a thread to avoid freezing event loop
+    response = await aio_to_thread(
+        G.api.make_request,
+        'GET',
+        G.api.PLAYHEADS_ENDPOINT.format(G.api.account_data.account_id),
+        None,
+        {
             'locale': G.args.subtitle,
             'content_ids': ','.join(episode_ids)
-        }
+        },
+        None,
+        None,
+        False,
+        15
     )
 
     out = {}
@@ -152,13 +185,20 @@ async def get_playheads_from_api(episode_ids: Union[str, list]) -> Dict:
 async def get_watchlist_status_from_api(ids: list) -> list:
     """ retrieve watchlist status for given media ids """
 
-    req = G.api.make_request(
-        method="GET",
-        url=G.api.WATCHLIST_V2_ENDPOINT.format(G.api.account_data.account_id),
-        params={
+    # Offload blocking request into a thread to avoid freezing event loop
+    req = await aio_to_thread(
+        G.api.make_request,
+        'GET',
+        G.api.WATCHLIST_V2_ENDPOINT.format(G.api.account_data.account_id),
+        None,
+        {
             "content_ids": ','.join(ids),
             "locale": G.args.subtitle
-        }
+        },
+        None,
+        None,
+        False,
+        15
     )
 
     if not req or req.get("error") is not None:
@@ -187,14 +227,19 @@ def get_img_from_struct(item: Dict, image_type: str, depth: int = 2) -> Union[st
     """ dive into API info structure and extract requested image from its struct """
 
     # @todo: add option to specify quality / max size
-    if item.get("images") and item.get("images").get(image_type):
-        src = item.get("images").get(image_type)
-        for i in range(0, depth):
-            if src[-1]:
+    images = item.get("images") or {}
+    seq = images.get(image_type) or []
+    # Expect a nested list structure like [[{source:...}, ...], ...]
+    if isinstance(seq, list) and seq:
+        src = seq
+        for _ in range(0, depth):
+            # Ensure current level is a non-empty list before indexing
+            if isinstance(src, list) and src:
                 src = src[-1]
             else:
                 return None
-        if src.get('source'):
+        # Final level should be a dict with 'source'
+        if isinstance(src, dict) and src.get('source'):
             return src.get('source')
 
     return None

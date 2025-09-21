@@ -18,7 +18,7 @@ import asyncio
 import datetime
 import os
 import sys
-from typing import Union, Dict, Optional, Any
+from typing import Union, Dict, Optional, Any, List
 
 import requests
 import xbmc
@@ -29,22 +29,28 @@ import xbmcvfs
 from resources.lib.globals import G
 from resources.lib.model import Object, CrunchyrollError, PlayableItem
 from resources.lib.utils import log_error_with_trace, crunchy_log, \
-    get_playheads_from_api, get_cms_object_data_by_ids, get_listables_from_response
+    get_playheads_from_api, get_cms_object_data_by_ids, get_listables_from_response, aio_to_thread
+
+# Fix for bug in old python version on Windows when using asyncio.run
+# @see: https://github.com/smirgol/plugin.video.crunchyroll/issues/44
+# @see: https://stackoverflow.com/questions/63860576/asyncio-event-loop-is-closed-when-using-asyncio-run
+if sys.platform == "win32" and sys.version_info >= (3, 8, 0):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 class VideoPlayerStreamData(Object):
     """ DTO to hold all relevant data for playback """
 
     def __init__(self):
-        self.stream_url: str | None = None
-        self.subtitle_urls: list[str] | None = None
+        self.stream_url: Optional[str] = None
+        self.subtitle_urls: Optional[List[str]] = None
         self.skip_events_data: Dict = {}
         self.playheads_data: Dict = {}
         # PlayableItem which is about to be played, that contains cms object data
-        self.playable_item: PlayableItem | None = None
+        self.playable_item: Optional[PlayableItem] = None
         # PlayableItem which contains cms obj data of playable_item's parent, if exists (Episodes, not Movies). currently not used.
-        self.playable_item_parent: PlayableItem | None = None
-        self.token: str | None = None
+        self.playable_item_parent: Optional[PlayableItem] = None
+        self.token: Optional[str] = None
 
 
 class VideoStream(Object):
@@ -96,8 +102,7 @@ class VideoStream(Object):
         """ gather data asynchronously and return them as a dictionary """
 
         # create threads
-        # actually not sure if this works, as the requests lib is not async
-        # also not sure if this is thread safe in any way, what if session is timed-out when starting this?
+        # Use true concurrency by offloading blocking I/O to threads
         t_stream_data = asyncio.create_task(self._get_stream_data_from_api())
         t_skip_events_data = asyncio.create_task(self._get_skip_events(G.args.get_arg('episode_id')))
         t_playheads = asyncio.create_task(get_playheads_from_api(G.args.get_arg('episode_id')))
@@ -108,8 +113,8 @@ class VideoStream(Object):
         # start async requests and fetch results
         results = await asyncio.gather(t_stream_data, t_skip_events_data, t_playheads, t_item_data)
 
-        playable_item = get_listables_from_response([results[3].get(G.args.get_arg('episode_id'))]) if \
-            results[3] else None
+        cms_obj = results[3].get(G.args.get_arg('episode_id')) if results[3] else None
+        playable_item = get_listables_from_response([cms_obj]) if cms_obj else None
 
         return {
             'stream_data': results[0] or {},
@@ -129,7 +134,7 @@ class VideoStream(Object):
 
         try:
             # Primary: Android TV playback v2 endpoint via cloudscraper (handles CF)
-            stream_data = G.api.request_playback_v2(episode_id, audio=G.args.subtitle)
+            stream_data = await aio_to_thread(G.api.request_playback_v2, episode_id, G.args.subtitle)
 
             # Fallback: legacy phone endpoint if ATV fails, returns error, or misses essentials
             if (not stream_data or
@@ -139,7 +144,7 @@ class VideoStream(Object):
                 not stream_data.get('token')):
                 error_msg = stream_data.get('error', 'Unknown error') if stream_data else 'No response'
                 crunchy_log(f"ATV playback v2 failed: {error_msg} - trying phone fallback")
-                stream_data = G.api.request_playback_phone(episode_id)
+                stream_data = await aio_to_thread(G.api.request_playback_phone, episode_id)
 
             if not stream_data or "error" in stream_data:
                 error_msg = stream_data.get('error', 'Unknown error') if stream_data else 'No response'
@@ -194,11 +199,12 @@ class VideoStream(Object):
         subtitles_data_raw = []
         subtitles_url_cached = []
 
-        if G.args.subtitle in api_stream_data["subtitles"]:
-            subtitles_data_raw.append(api_stream_data.get("subtitles").get(G.args.subtitle))
-
-        if G.args.subtitle_fallback and G.args.subtitle_fallback in api_stream_data["subtitles"]:
-            subtitles_data_raw.append(api_stream_data.get("subtitles").get(G.args.subtitle_fallback))
+        subs = (api_stream_data or {}).get("subtitles") or {}
+        if isinstance(subs, dict):
+            if G.args.subtitle in subs:
+                subtitles_data_raw.append(subs.get(G.args.subtitle))
+            if G.args.subtitle_fallback and G.args.subtitle_fallback in subs:
+                subtitles_data_raw.append(subs.get(G.args.subtitle_fallback))
 
         if not subtitles_data_raw:
             return None

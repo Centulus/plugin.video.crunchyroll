@@ -20,6 +20,7 @@ from typing import Optional, List
 from urllib.parse import urlencode
 
 import requests
+import random
 import xbmc
 import xbmcgui
 import xbmcplugin
@@ -160,18 +161,6 @@ class VideoPlayer(Object):
             except Exception:
                 pass
             self.clear_active_stream()
-            # Clean up local MPD proxy server if running
-            try:
-                if hasattr(self, '_local_server') and self._local_server:
-                    self._local_server.shutdown()
-                    self._local_server.server_close()
-                if hasattr(self, '_server_thread') and self._server_thread:
-                    # give a bit more time to exit cleanly
-                    self._server_thread.join(timeout=2.0)
-                self._local_server = None
-                self._server_thread = None
-            except Exception:
-                pass
 
     def _get_video_stream_data(self) -> bool:
         """ Fetch all required stream data using VideoStream object """
@@ -226,7 +215,7 @@ class VideoPlayer(Object):
             pass
 
         item = self._stream_data.playable_item.to_item()
-        # Track the (initial) playing URL. Might change to local proxy later.
+        # Use the original stream URL directly (no local file/proxy)
         item.setPath(self._stream_data.stream_url)
         self._playing_url = self._stream_data.stream_url
         item.setMimeType('application/dash+xml')
@@ -252,8 +241,17 @@ class VideoPlayer(Object):
             'x-cr-content-id': G.args.get_arg('episode_id'),
             'x-cr-video-token': self._stream_data.token
         }
+        # Ensure we have a Cloudflare cookie from API init if available
+        try:
+            if not getattr(G.api, 'cf_cookie', None):
+                utils.crunchy_log("Initializing Cloudflare cookie for manifest", xbmc.LOGINFO)
+                G.api.init_cf_cookie()
+        except Exception:
+            pass
+        # Apply existing API CF cookie to both license and manifest headers (will be overridden if validation returns newer cookies)
         if hasattr(G.api, 'cf_cookie') and G.api.cf_cookie:
             license_headers['Cookie'] = G.api.cf_cookie
+            manifest_headers['Cookie'] = G.api.cf_cookie
         license_config = {
             'license_server_url': G.api.LICENSE_ENDPOINT,
             'headers': urlencode(license_headers),
@@ -261,8 +259,46 @@ class VideoPlayer(Object):
             'response_data': 'JBlicense'
         }
 
-        # Use cloudscraper to bypass Cloudflare protection via local HTTP proxy
-        self._setup_mpd_proxy(item, manifest_headers)
+        # Validate MPD access and get cookies via cloudscraper (random UA from browsers.json)
+        cf_cookie, ua_used, _ = self._validate_mpd_and_get_cookie(manifest_headers)
+        try:
+            if isinstance(ua_used, str) and ('Chrome' in ua_used or 'Chromium' in ua_used or 'CriOS' in ua_used):
+                chosen_ua = ua_used
+            else:
+                chosen_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        except Exception:
+            chosen_ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        chosen_cookie = cf_cookie or getattr(G.api, 'cf_cookie', None)
+        if chosen_cookie:
+            manifest_headers['Cookie'] = chosen_cookie
+            license_headers['Cookie'] = chosen_cookie
+        
+        # Add headers to manifest/stream headers
+        manifest_headers['User-Agent'] = chosen_ua
+        manifest_headers['Accept'] = 'application/dash+xml,application/xml,text/xml,*/*'
+        manifest_headers['Accept-Language'] = 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7'
+        # Align license UA with the UA that obtained the cookies
+        try:
+            license_headers['User-Agent'] = chosen_ua
+        except Exception:
+            pass
+
+        try:
+            manifest_headers['x-cr-content-id'] = G.args.get_arg('episode_id') or ''
+        except Exception:
+            manifest_headers['x-cr-content-id'] = ''
+        try:
+            manifest_headers['x-cr-video-token'] = self._stream_data.token or ''
+        except Exception:
+            manifest_headers['x-cr-video-token'] = ''
+        # Provide a neutral referer for www domain (optional but fine)
+        manifest_headers['Referer'] = 'https://www.crunchyroll.com/'
+
+        # Build header strings for ISA (URL-encoded key=value&key2=value2)
+        manifest_headers_str = urlencode(manifest_headers)
+        license_headers_str = urlencode(license_headers)
+        # Update license config with updated headers
+        license_config['headers'] = license_headers_str
 
         inputstream_config = {
             'ssl_verify_peer': False
@@ -270,10 +306,17 @@ class VideoPlayer(Object):
 
         item.setProperty("inputstream", "inputstream.adaptive")
         item.setProperty("inputstream.adaptive.license_type", "com.widevine.alpha")
-        item.setProperty('inputstream.adaptive.stream_headers', urlencode(manifest_headers))
-        item.setProperty("inputstream.adaptive.manifest_headers", urlencode(manifest_headers))
-        item.setProperty('inputstream.adaptive.license_key', '|'.join(list(license_config.values())))
+        item.setProperty('inputstream.adaptive.stream_headers', manifest_headers_str)
+        item.setProperty("inputstream.adaptive.manifest_headers", manifest_headers_str)
+        item.setProperty('inputstream.adaptive.license_key', '|'.join([
+            license_config['license_server_url'],
+            license_config['headers'],
+            license_config['post_data'],
+            license_config['response_data']
+        ]))
         item.setProperty('inputstream.adaptive.config', json.dumps(inputstream_config))
+
+        # Keep remote MPD URL; ISA will fetch it using provided headers/cookies
 
         # @todo: i think other meta data like description and images are still fetched from args.
         #        we should call the objects endpoint and use this data to remove args dependency (besides id)
@@ -319,65 +362,133 @@ class VideoPlayer(Object):
         except Exception:
             return max(0, seconds)
 
-    def _setup_mpd_proxy(self, item, manifest_headers):
-        """Setup local HTTP proxy to serve MPD content via cloudscraper."""
+    def _validate_mpd_and_get_cookie(self, manifest_headers):
+        """Validate MPD access via cloudscraper using a random UA from browsers.json.
+        Returns a tuple: (cookie_header_string, ua_used, mpd_text)
+        """
         try:
-            import threading
-            import http.server
-            import socketserver
             from ..modules import cloudscraper
 
-            # Fetch MPD via cloudscraper (shorter delay to reduce blocking)
-            scraper = cloudscraper.create_scraper(delay=5, browser={'custom': 'okhttp/4.12.0'})
-            resp = scraper.get(self._stream_data.stream_url, headers=manifest_headers, timeout=15)
-            utils.crunchy_log(f"MPD fetch via cloudscraper: {resp.status_code}")
-            
-            if resp.ok and resp.headers.get('Content-Type', '').startswith('application/dash+xml'):
-                mpd_content = resp.text
-                
-                class MPDHandler(http.server.BaseHTTPRequestHandler):
-                    def do_GET(self):
-                        if self.path == '/manifest.mpd':
-                            self.send_response(200)
-                            self.send_header('Content-Type', 'application/dash+xml')
-                            self.send_header('Content-Length', str(len(mpd_content.encode('utf-8'))))
-                            self.send_header('Access-Control-Allow-Origin', '*')
-                            self.end_headers()
-                            self.wfile.write(mpd_content.encode('utf-8'))
-                        else:
-                            self.send_error(404)
-                    
-                    def log_message(self, format, *args):
-                        pass  # Suppress HTTP server logs
-                
-                # Start local HTTP server (threading, allow quick reuse)
-                class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-                    daemon_threads = True
-                    allow_reuse_address = True
+            # Reuse recent cookies/UA when available to avoid re-solving Cloudflare every time
+            try:
+                if getattr(G.api, 'cf_cookie', None) and getattr(G.api, 'cf_ts', 0):
+                    ttl_seconds = 600  # 10 minutes TTL; extend if stable for you
+                    if (time.time() - getattr(G.api, 'cf_ts', 0)) < ttl_seconds:
+                        return G.api.cf_cookie, getattr(G.api, 'cf_ua', None), None
+            except Exception:
+                pass
 
-                httpd = ThreadingTCPServer(("127.0.0.1", 0), MPDHandler)
-                port = httpd.server_address[1]
-                local_url = f"http://127.0.0.1:{port}/manifest.mpd"
+            # Build headers for the cloudscraper request
+            prefetch_headers = dict(manifest_headers)
+            # Let cloudscraper decide the UA; don't override here
+            prefetch_headers.pop('User-Agent', None)
+            # Include existing CF cookie if available
+            if hasattr(G.api, 'cf_cookie') and G.api.cf_cookie:
+                prefetch_headers['Cookie'] = G.api.cf_cookie
+            
+            # Add more headers to match what might be expected
+            prefetch_headers['Accept'] = 'application/dash+xml,application/xml,text/xml,*/*'
+            prefetch_headers['Accept-Language'] = 'en-US,en;q=0.9'
+            prefetch_headers['Origin'] = 'https://static.crunchyroll.com'
+            prefetch_headers['Referer'] = 'https://static.crunchyroll.com/'
+
+            # Use a longer delay to ensure challenge is fully solved
+            browser_candidates = [
+                {'browser': 'chrome',  'platform': 'windows', 'mobile': False},
+                {'browser': 'chrome',  'platform': 'android', 'mobile': True},
+            ]
+            browser_cfg = random.choice(browser_candidates)
+            scraper = cloudscraper.create_scraper(
+                delay=10,
+                browser=browser_cfg,
+                captcha={'provider': 'return_response'}  # Return response even if captcha
+            )
+            cf_cookie = None
+            mpd_text = None
+            ua_used = None
+            resp = None
+            try:
+                # Warm-up visit on homepage to ensure domain-level CF cookies are set
+                try:
+                    scraper.get('https://www.crunchyroll.com/', headers=prefetch_headers, timeout=15)
+                except Exception:
+                    pass
+                resp = scraper.get(self._stream_data.stream_url, headers=prefetch_headers, timeout=15)
+                try:
+                    ua_used = scraper.headers.get('User-Agent')
+                except Exception:
+                    ua_used = None
+                if resp.ok:
+                    try:
+                        mpd_text = resp.text
+                    except Exception:
+                        mpd_text = None
                 
-                # Start server in background thread
-                server_thread = threading.Thread(target=httpd.serve_forever)
-                server_thread.daemon = True
-                server_thread.start()
-                
-                # Update item to use local proxy
-                item.setPath(local_url)
-                utils.crunchy_log(f"MPD proxy serving at: {local_url}")
-                
-                # Keep references for cleanup
-                self._local_server = httpd
-                self._server_thread = server_thread
-                # Ensure isPlaying() checks the local proxy URL
-                self._playing_url = local_url
-            else:
-                utils.crunchy_log(f"Failed to fetch MPD via cloudscraper: {resp.status_code}")
-                
+                # Extract ALL cookies from the session (not just CF)
+                if resp.ok:
+                    # Get all cookies from the entire session (includes CF challenge cookies)
+                    all_cookies = []
+                    
+                    # Extract from response cookies
+                    for cookie in resp.cookies:
+                        all_cookies.append(f"{cookie.name}={cookie.value}")
+                    
+                    # Also get cookies from the scraper session
+                    try:
+                        session_cookies = scraper.cookies
+                        for cookie in session_cookies:
+                            cookie_str = f"{cookie.name}={cookie.value}"
+                            if cookie_str not in all_cookies:
+                                all_cookies.append(cookie_str)
+                    except Exception:
+                        pass
+
+                    # Merge cookies from prefetch (e.g., cr_exp) if not present yet
+                    try:
+                        pre_cookie_str = prefetch_headers.get('Cookie')
+                        if pre_cookie_str:
+                            existing_names = {c.split('=', 1)[0] for c in all_cookies}
+                            for part in pre_cookie_str.split(';'):
+                                part = part.strip()
+                                if not part or '=' not in part:
+                                    continue
+                                name = part.split('=', 1)[0]
+                                if name not in existing_names:
+                                    all_cookies.append(part)
+                    except Exception:
+                        pass
+                    
+                    if all_cookies:
+                        cf_cookie = '; '.join(all_cookies)
+                    else:
+                        # Fallback to existing CF cookie from API
+                        cf_cookie = getattr(G.api, 'cf_cookie', None)
+                # Persist cookies for global reuse
+                try:
+                    if cf_cookie:
+                        G.api.cf_cookie = cf_cookie
+                        G.api.cf_ua = ua_used
+                        G.api.cf_ts = time.time()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    scraper.close()
+                except Exception:
+                    pass
+
+            if not resp or not getattr(resp, 'ok', False):
+                try:
+                    code = getattr(resp, 'status_code', 'N/A')
+                except Exception:
+                    code = 'N/A'
+                utils.crunchy_log(f"Failed to validate MPD via cloudscraper: {code}", xbmc.LOGERROR)
+            
+            return cf_cookie, ua_used, mpd_text
+
         except Exception as e:
-            utils.log_error_with_trace(f"MPD proxy setup failed: {e}", False)
+            utils.log_error_with_trace(f"MPD validation failed: {e}", False)
+            return None, None, None
 
     # ==== Playback event handlers ====
     def _emit_playhead(self, label: str, pos: int, force: bool = False):
@@ -570,7 +681,13 @@ class VideoPlayer(Object):
             # Keep it visible only for a bounded duration
             t0 = time.time()
             while dlg and (time.time() - t0) < max(1, int(dialog_duration)):
-                xbmc.sleep(100)
+                # Abort-aware wait in 100ms slices
+                try:
+                    _monitor = xbmc.Monitor()
+                    if _monitor.waitForAbort(0.1):
+                        break
+                except Exception:
+                    pass
                 # If user pressed the button, the dialog will close itself
                 if not dlg.isVisible():
                     break
@@ -611,8 +728,11 @@ class VideoPlayer(Object):
                 return
             except (CrunchyrollError, LoginError, requests.exceptions.RequestException) as _e:
                 if attempt == 0:
+                    # Abort-aware small backoff instead of time.sleep to keep Kodi responsive
                     try:
-                        time.sleep(0.5)
+                        _monitor = xbmc.Monitor()
+                        if _monitor.waitForAbort(0.5):
+                            return
                     except Exception:
                         pass
                 else:
@@ -736,7 +856,14 @@ def update_playhead(content_id: str, playhead: int):
         
         utils.crunchy_log(f"POST {url} with payload {payload}", xbmc.LOGINFO)
         
-        r = scraper.post(url, json=payload, headers=headers, timeout=15)
+        try:
+            r = scraper.post(url, json=payload, headers=headers, timeout=15)
+        finally:
+            # Always close ad-hoc cloudscraper sessions
+            try:
+                scraper.close()
+            except Exception:
+                pass
         utils.crunchy_log(f"Playhead response: {r.status_code} - {r.text[:200]}", xbmc.LOGINFO)
 
         if r.status_code == 401:

@@ -16,7 +16,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import random
 import secrets
 import re
 
@@ -125,7 +124,24 @@ def main(argv):
                                         expires_in=expires_in, interval_ms=interval_ms,
                                         device_code=device_code, api_instance=G.api)
                 dialog.show()
-                xbmc.log("[Crunchyroll] Activation dialog shown", xbmc.LOGINFO)
+                # Make sure the timer thread is stopped on shutdown as a last resort
+                try:
+                    if getattr(G, 'shutdown', None):
+                        def _cleanup_activation_dialog():
+                            try:
+                                if hasattr(dialog, 'stop_timer'):
+                                    dialog.stop_timer(timeout=1.0)
+                            except Exception:
+                                pass
+                            try:
+                                dialog.close()
+                            except Exception:
+                                pass
+                        G.shutdown.register('activation_dialog', _cleanup_activation_dialog)
+                except Exception:
+                    pass
+                from . import utils as _utils
+                _utils.crunchy_log("Activation dialog shown", xbmc.LOGINFO)
 
                 import time as _t
                 start_ts = _t.time()
@@ -155,7 +171,7 @@ def main(argv):
                                         pass
                                     break
                                 else:
-                                    xbmc.log("[Crunchyroll] Activation expired - regenerating code (main loop)", xbmc.LOGINFO)
+                                    _utils.crunchy_log("Activation expired - regenerating code (main loop)", xbmc.LOGINFO)
                                 
                                 # Request/refresh device_code when either <3 expirations or after Retry
                                 device = G.api.request_device_code()
@@ -190,7 +206,7 @@ def main(argv):
                         if (not getattr(dialog, 'is_running', True)
                                 and not getattr(dialog, 'expired', False)
                                 and not getattr(dialog, 'canceled', False)):
-                            xbmc.log("[Crunchyroll] Activation dialog closed unexpectedly - reopening", xbmc.LOGWARNING)
+                            _utils.crunchy_log("Activation dialog closed unexpectedly - reopening", xbmc.LOGWARNING)
                             try:
                                 # Ensure any timer from old instance is stopped
                                 if hasattr(dialog, 'stop_timer'):
@@ -206,12 +222,16 @@ def main(argv):
                                                          device_code=device_code, api_instance=G.api)
                                 dialog.show()
                                 dialog.start_timer()
-                                xbmc.log("[Crunchyroll] Activation dialog re-opened", xbmc.LOGINFO)
-                                # Small delay to let UI settle
-                                _t.sleep(0.1)
+                                _utils.crunchy_log("Activation dialog re-opened", xbmc.LOGINFO)
+                                # Small delay to let UI settle (abort-aware)
+                                try:
+                                    _monitor = xbmc.Monitor()
+                                    _monitor.waitForAbort(0.1)
+                                except Exception:
+                                    pass
                                 continue
                             except Exception as _re_err:
-                                xbmc.log(f"[Crunchyroll] Failed to reopen activation dialog: {_re_err}", xbmc.LOGERROR)
+                                _utils.crunchy_log(f"Failed to reopen activation dialog: {_re_err}", xbmc.LOGERROR)
                                 user_cancelled = True
                                 break
 
@@ -222,7 +242,7 @@ def main(argv):
                         try:
                             token = G.api.poll_device_token(current_device_code)
                         except Exception as _poll_err:
-                            xbmc.log(f"[Crunchyroll] Poll error (ignored): {_poll_err}", xbmc.LOGWARNING)
+                            _utils.crunchy_log(f"Poll error (ignored): {_poll_err}", xbmc.LOGWARNING)
                             # brief wait to avoid tight loop in case of repeated errors
                             _monitor = xbmc.Monitor()
                             if _monitor.waitForAbort(0.25):
@@ -263,7 +283,7 @@ def main(argv):
                     except Exception as cleanup_error:
                         # Log cleanup errors but don't propagate them
                         try:
-                            xbmc.log(f"[Crunchyroll] Dialog cleanup error: {cleanup_error}", xbmc.LOGWARNING)
+                            _utils.crunchy_log(f"Dialog cleanup error: {cleanup_error}", xbmc.LOGWARNING)
                         except Exception:
                             pass  # Even logging can fail during shutdown
 

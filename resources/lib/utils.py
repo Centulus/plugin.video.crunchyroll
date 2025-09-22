@@ -254,6 +254,19 @@ def log(message) -> None:
 
 
 def crunchy_log(message, loglevel=xbmc.LOGINFO) -> None:
+    """Central logging helper.
+
+    - Silences logs when global shutdown is requested (G.noop_logging).
+    - Avoids logging from non-main threads to reduce risks during teardown on Python 3.8/Windows.
+    """
+    try:
+        if getattr(G, 'noop_logging', False):
+            return
+        import threading
+        if threading.current_thread().name != 'MainThread':
+            return
+    except Exception:
+        pass
     addon_name = G.args.addon_name if G.args is not None and hasattr(G.args, 'addon_name') else "Crunchyroll"
     xbmc.log("[PLUGIN] %s: %s" % (addon_name, str(message)), loglevel)
 
@@ -277,16 +290,20 @@ def log_error_with_trace(message, show_notification: bool = True) -> None:
 
     addon_name = G.args.addon_name if G.args is not None and hasattr(G.args, 'addon_name') else "Crunchyroll"
 
-    xbmc.log("[PLUGIN] %s: %s" % (addon_name, str(message)), xbmc.LOGERROR)
-    xbmc.log("[PLUGIN] %s: %s %s\n%s" % (addon_name, ex_type.__name__, ex_value, "\n".join(stack_trace)), xbmc.LOGERROR)
-
-    if show_notification:
-        xbmcgui.Dialog().notification(
-            '%s Error' % addon_name,
-            'Please check logs for details',
-            xbmcgui.NOTIFICATION_ERROR,
-            5
-        )
+    try:
+        if not getattr(G, 'noop_logging', False):
+            xbmc.log("[PLUGIN] %s: %s" % (addon_name, str(message)), xbmc.LOGERROR)
+            xbmc.log("[PLUGIN] %s: %s %s\n%s" % (addon_name, ex_type.__name__, ex_value, "\n".join(stack_trace)), xbmc.LOGERROR)
+            if show_notification:
+                xbmcgui.Dialog().notification(
+                    '%s Error' % addon_name,
+                    'Please check logs for details',
+                    xbmcgui.NOTIFICATION_ERROR,
+                    5
+                )
+    except Exception:
+        # Swallow any logging/notification errors during teardown
+        pass
 
 def filter_series(seriesItem: Dict) -> bool:
     """ takes an API info struct and returns if it matches user language settings """

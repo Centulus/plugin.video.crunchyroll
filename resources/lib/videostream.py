@@ -68,6 +68,12 @@ class VideoStream(Object):
 
     def __init__(self, ):
         self.cache_expiration_time: int = 60 * 60 * 24 * 7  # 7 days
+        # Ensure base cache directory exists before any listdir/use
+        try:
+            base_dir = self.get_cache_path()
+            xbmcvfs.mkdirs(base_dir)
+        except Exception:
+            pass
         # cache cleanup
         self._clean_cache_subtitles()
 
@@ -289,6 +295,10 @@ class VideoStream(Object):
         expires = datetime.datetime.now() - datetime.timedelta(seconds=self.cache_expiration_time)
 
         cache_base_dir = self.get_cache_path()
+        try:
+            xbmcvfs.mkdirs(cache_base_dir)
+        except Exception:
+            pass
         dirs, files = xbmcvfs.listdir(cache_base_dir)
 
         for cache_dir in dirs:

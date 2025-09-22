@@ -222,8 +222,11 @@ class API:
                 "refresh_token": self.account_data.refresh_token
             }
 
-        # Always use cloudscraper for token requests (CF by default)
-        scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
+        # Always use cloudscraper for token requests (CF by default).
+        scraper = cloudscraper.create_scraper(
+            delay=10,
+            browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA}
+        )
         try:
             r = scraper.post(
                 url=API.TOKEN_ENDPOINT,
@@ -239,6 +242,12 @@ class API:
             self._update_cookie_from_scraper(scraper)
         except Exception:
             pass
+        finally:
+            # Close the ad-hoc session; we keep long-lived one in self.http
+            try:
+                scraper.close()
+            except Exception:
+                pass
 
         # if refreshing and refresh token is expired, it will throw a 400
         # clear session data and let caller handle re-authentication
@@ -350,8 +359,8 @@ class API:
 
     def init_cf_cookie(self) -> None:
         """Trigger a 401 on content endpoint to obtain __cf_bm cookie."""
+        scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
         try:
-            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
             resp = scraper.get(
                 "https://www.crunchyroll.com/content/v2/discover/browse",
                 params={"locale": "en-US", "sort_by": "popularity", "n": 1},
@@ -366,6 +375,11 @@ class API:
             self._update_cookie_from_scraper(scraper)
         except requests.exceptions.RequestException:
             pass
+        finally:
+            try:
+                scraper.close()
+            except Exception:
+                pass
 
     def acquire_anonymous_token(self) -> Optional[Dict]:
         """Acquire anonymous access token (not used for content, helps establish session)."""
@@ -393,6 +407,11 @@ class API:
                 return r.json()
         except requests.exceptions.RequestException:
             pass
+        finally:
+            try:
+                scraper.close()
+            except Exception:
+                pass
         return None
 
     def request_device_code(self) -> Optional[Dict]:
@@ -416,6 +435,11 @@ class API:
                 return r.json()
         except requests.exceptions.RequestException:
             pass
+        finally:
+            try:
+                scraper.close()
+            except Exception:
+                pass
         return None
 
     def poll_device_token(self, device_code: str) -> Optional[Dict]:
@@ -439,6 +463,11 @@ class API:
                 return r.json()
         except requests.exceptions.RequestException:
             pass
+        finally:
+            try:
+                scraper.close()
+            except Exception:
+                pass
         return None
 
     def _finalize_session_from_token_response(self, r_json: Dict) -> None:
@@ -517,6 +546,11 @@ class API:
         """
         self.account_data.delete_storage()
         self.profile_data.delete_storage()
+        try:
+            if getattr(self, 'http', None):
+                self.http.close()
+        except Exception:
+            pass
 
     def make_request(
             self,
@@ -556,8 +590,8 @@ class API:
             request_headers["User-Agent"] = API.CRUNCHYROLL_UA
         # Route all www requests through cloudscraper (CF by default)
         if url.startswith("https://www.crunchyroll.com"):
+            scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
             try:
-                scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
                 if getattr(self, 'cf_cookie', None):
                     request_headers["Cookie"] = self.cf_cookie
                 r = scraper.request(
@@ -575,6 +609,11 @@ class API:
                     pass
             except requests.exceptions.RequestException as _e:
                 raise CrunchyrollError(f"Request failed: {_e}")
+            finally:
+                try:
+                    scraper.close()
+                except Exception:
+                    pass
         else:
             r = self.http.request(
                 method,
@@ -642,6 +681,11 @@ class API:
                 return r.json()
         except requests.exceptions.RequestException:
             pass
+        finally:
+            try:
+                scraper.close()
+            except Exception:
+                pass
         return None
 
     def request_playback_phone(self, episode_id: str) -> Optional[Dict]:

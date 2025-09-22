@@ -149,6 +149,7 @@ class ActivationDialog(xbmcgui.WindowXMLDialog):
             self._timer_running = True
             with self._lock or DummyLock():
                 self.start_time = time.time()
+            # Run as daemon; we still join on stop, but this prevents teardown crashes if something slips through
             self.timer_thread = threading.Thread(target=self._timer_loop, daemon=True)
             self.timer_thread.start()
         except Exception:

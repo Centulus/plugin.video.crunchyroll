@@ -712,7 +712,7 @@ class VideoPlayer(Object):
             Crunchyroll keeps track of started streams. If they are not released, CR will block starting a new one.
         """
 
-        if not G.args.get_arg('episode_id') or not self._stream_data.token:
+        if not G.args.get_arg('episode_id') or not self._stream_data or not self._stream_data.token:
             return
 
         token = token or self._stream_data.token

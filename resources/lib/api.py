@@ -60,10 +60,10 @@ class API:
     
     # Playback endpoints
     STREAMS_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/videos/{}/streams"
-    STREAMS_ENDPOINT_DRM = "https://www.crunchyroll.com/playback/v2/{}/tv/android_tv/play"
+    STREAMS_ENDPOINT_DRM = "https://www.crunchyroll.com/playback/v3/{}/tv/android_tv/play"
     # Fallback legacy phone playback endpoint (kept for compatibility)
     STREAMS_ENDPOINT_DRM_PHONE = "https://cr-play-service.prd.crunchyrollsvc.com/v1/{}/android/phone/play"
-    STREAMS_ENDPOINT_CLEAR_STREAM = "https://cr-play-service.prd.crunchyrollsvc.com/v1/token/{}/{}"
+    STREAMS_ENDPOINT_CLEAR_STREAM = "https://www.crunchyroll.com/playback/v1/token/{}/{}"
     STREAMS_ENDPOINT_GET_ACTIVE_STREAMS = "https://cr-play-service.prd.crunchyrollsvc.com/playback/v1/sessions/streaming"
     # SERIES_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/series/{}"
     SEASONS_ENDPOINT = "https://beta-api.crunchyroll.com/cms/v2{}/seasons"
@@ -235,8 +235,8 @@ class API:
                 timeout=20
             )
         except requests.exceptions.RequestException as e:
-            # Critical path: don't swallow auth errors, log and raise
-            utils.crunchy_log(f"Token request failed: {e}", xbmc.LOGERROR)
+            # xbmc.log, not crunchy_log: this can run off the main thread, which crunchy_log ignores.
+            xbmc.log(f"[PLUGIN] Crunchyroll: Token request failed: {e}", xbmc.LOGERROR)
             raise LoginError("Token request failed")
         try:
             self._update_cookie_from_scraper(scraper)
@@ -252,23 +252,26 @@ class API:
         # if refreshing and refresh token is expired, it will throw a 400
         # clear session data and let caller handle re-authentication
         if r.status_code == 400:
-            utils.crunchy_log("Invalid/Expired credentials - refresh token is dead")
+            xbmc.log(f"[PLUGIN] Crunchyroll: Invalid/Expired credentials - refresh token is dead: {r.text[:300]}",
+                      xbmc.LOGERROR)
             self.retry_counter = self.retry_counter + 1
-            
+
             # Clear session data
             self.account_data.delete_storage()
             self.account_data = AccountData({})
-            
+
             if self.retry_counter > 2:
-                utils.crunchy_log("Max retries exceeded. Aborting!", xbmc.LOGERROR)
+                xbmc.log("[PLUGIN] Crunchyroll: Max retries exceeded. Aborting!", xbmc.LOGERROR)
                 raise LoginError("Failed to authenticate twice")
-            
-            # Don't retry here - let start() handle the re-authentication
-            utils.crunchy_log("Session cleared - will trigger device-code flow")
-            return
+
+            # clear the stale header too, so a caller can't retry with the same dead token
+            self.api_headers.pop("Authorization", None)
+
+            xbmc.log("[PLUGIN] Crunchyroll: Session cleared - will trigger device-code flow", xbmc.LOGWARNING)
+            raise LoginError("Refresh token is dead - re-authentication required")
 
         if r.status_code == 403:
-            utils.crunchy_log("Cloudflare blocked token request", xbmc.LOGERROR)
+            xbmc.log("[PLUGIN] Crunchyroll: Cloudflare blocked token request", xbmc.LOGERROR)
             raise LoginError("Failed to bypass cloudflare")
 
         r_json = get_json_from_response(r)
@@ -583,8 +586,8 @@ class API:
         request_headers.update(self.api_headers)
         request_headers.update(headers)
 
-        # ensure UA reflects active session; use ATV UA for ATV playback endpoint
-        if "playback/v2" in url and API.UA_ATV:
+        # ensure UA reflects active session; use ATV UA for ATV playback endpoints
+        if "/playback/v" in url and API.UA_ATV:
             request_headers["User-Agent"] = API.UA_ATV
         else:
             request_headers["User-Agent"] = API.CRUNCHYROLL_UA
@@ -648,7 +651,9 @@ class API:
 
         return get_json_from_response(r)
 
-    def request_playback_v2(self, episode_id: str, audio: Optional[str] = None, queue: bool = False) -> Optional[Dict]:
+    def request_playback_v2(
+            self, episode_id: str, audio: Optional[str] = None, queue: bool = False, _retried: bool = False
+    ) -> Optional[Dict]:
         """Call the Android TV playback v2 endpoint using cloudscraper."""
         try:
             scraper = cloudscraper.create_scraper(delay=10, browser={'custom': API.UA_ATV or API.CRUNCHYROLL_UA})
@@ -679,8 +684,30 @@ class API:
             if r.ok:
                 self._update_cookie_from_scraper(scraper)
                 return r.json()
-        except requests.exceptions.RequestException:
-            pass
+            # xbmc.log, not crunchy_log: this runs in a worker thread via aio_to_thread.
+            xbmc.log(
+                f"[PLUGIN] Crunchyroll: request_playback_v2: request failed with status "
+                f"{r.status_code}: {r.text[:300]}",
+                xbmc.LOGERROR
+            )
+            # CR returns 400/40016 "Outdated Token" instead of 401, so make_request()'s
+            # generic 401-refresh never catches it - refresh and retry once here instead.
+            if not _retried and r.status_code == 400 and '40016' in r.text:
+                xbmc.log(
+                    "[PLUGIN] Crunchyroll: request_playback_v2: outdated token - refreshing session and retrying once",
+                    xbmc.LOGWARNING
+                )
+                try:
+                    self.create_session(action="refresh")
+                except Exception as refresh_err:
+                    xbmc.log(
+                        f"[PLUGIN] Crunchyroll: request_playback_v2: session refresh failed: {refresh_err!r}",
+                        xbmc.LOGERROR
+                    )
+                else:
+                    return self.request_playback_v2(episode_id, audio, queue, _retried=True)
+        except Exception as e:
+            xbmc.log(f"[PLUGIN] Crunchyroll: request_playback_v2: request exception: {e!r}", xbmc.LOGERROR)
         finally:
             try:
                 scraper.close()
@@ -688,14 +715,30 @@ class API:
                 pass
         return None
 
-    def request_playback_phone(self, episode_id: str) -> Optional[Dict]:
+    def request_playback_phone(self, episode_id: str, _retried: bool = False) -> Optional[Dict]:
         """Fallback to legacy phone playback endpoint when ATV playback v2 fails."""
         try:
             return self.make_request(
                 method="GET",
                 url=API.STREAMS_ENDPOINT_DRM_PHONE.format(episode_id)
             )
-        except Exception:
+        except Exception as e:
+            xbmc.log(f"[PLUGIN] Crunchyroll: request_playback_phone: request exception: {e!r}", xbmc.LOGERROR)
+            # same outdated-token case as request_playback_v2
+            if not _retried and '40016' in str(e):
+                xbmc.log(
+                    "[PLUGIN] Crunchyroll: request_playback_phone: outdated token - refreshing session and retrying once",
+                    xbmc.LOGWARNING
+                )
+                try:
+                    self.create_session(action="refresh")
+                except Exception as refresh_err:
+                    xbmc.log(
+                        f"[PLUGIN] Crunchyroll: request_playback_phone: session refresh failed: {refresh_err!r}",
+                        xbmc.LOGERROR
+                    )
+                else:
+                    return self.request_playback_phone(episode_id, _retried=True)
             return None
 
     def _update_cookie_from_scraper(self, scraper) -> None:

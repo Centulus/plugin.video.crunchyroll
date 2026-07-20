@@ -140,7 +140,10 @@ class VideoStream(Object):
 
         try:
             # Primary: Android TV playback v2 endpoint via cloudscraper (handles CF)
-            stream_data = await aio_to_thread(G.api.request_playback_v2, episode_id, G.args.subtitle)
+            # audio param is the audio track locale, not the subtitle locale
+            stream_data = await aio_to_thread(
+                G.api.request_playback_v2, episode_id, G.api.account_data.default_audio_language
+            )
 
             # Fallback: legacy phone endpoint if ATV fails, returns error, or misses essentials
             if (not stream_data or

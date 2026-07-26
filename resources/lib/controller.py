@@ -492,26 +492,17 @@ def view_season():
 def view_episodes():
     """ view all episodes of season
     """
-    # api request
-    req = G.api.make_request(
-        method="GET",
-        url=G.api.EPISODES_ENDPOINT.format(G.api.account_data.cms.bucket),
-        params={
-            "locale": G.args.subtitle,
-            "season_id": G.args.get_arg('season_id')
-        },
-        timeout=15
-    )
+    episodes = utils.get_episodes_for_season(G.args.get_arg('season_id'))
 
     # check for error
-    if not req or "error" in req:
+    if not episodes:
         view.add_item({"title": G.args.addon.getLocalizedString(30061)})
         view.end_of_directory()
         return False
 
     # episodes / episodes  (crunchy / xbmc)
     view.add_listables(
-        listables=get_listables_from_response(req.get('items')),
+        listables=episodes,
         is_folder=False,
         options=view.OPT_NO_SEASON_TITLE
     )
@@ -520,11 +511,69 @@ def view_episodes():
     return True
 
 
+def fill_season_playlist(video_player: VideoPlayer):
+    """ Queue the rest of the season around the now-playing episode, enabling Kodi's
+    native next/previous and auto-advance.
+
+    Episodes are appended after the current item, then the current item is moved to its
+    season position via JSON-RPC Playlist.Swap, which keeps the player's position
+    tracking in sync (python PlayList.add(index) doesn't).
+    """
+    playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
+    if playlist.size() != 1:
+        # already in a season playlist (next/auto-advance), or not playing from the playlist
+        return
+
+    # season_id is known from the cms lookup done during stream resolution
+    playable_item = video_player.stream_data.playable_item if video_player.stream_data else None
+    season_id = getattr(playable_item, 'season_id', None) or G.args.get_arg('season_id')
+    episode_id = G.args.get_arg('episode_id')
+    if not season_id or not episode_id:
+        return
+
+    episodes = utils.get_episodes_for_season(season_id)
+    current = next((i for i, ep in enumerate(episodes) if ep.episode_id == episode_id), None)
+    if current is None:
+        return
+
+    def play_url(ep):
+        # must match the listing URLs, else the local playcount breaks
+        return "%s/video/%s/%s/%s" % (G.args.addonurl, ep.series_id, ep.episode_id, ep.stream_id)
+
+    for episode in episodes[:current] + episodes[current + 1:]:
+        playlist.add(play_url(episode), episode.to_item())
+
+    # bubble the current episode down to its season position
+    for position in range(current):
+        response = xbmc.executeJSONRPC(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "Playlist.Swap",
+            "params": {
+                "playlistid": xbmc.PLAYLIST_VIDEO,
+                "position1": position,
+                "position2": position + 1
+            }
+        }))
+        if '"error"' in response:
+            utils.crunchy_log(f"fill_season_playlist: Playlist.Swap failed: {response}", xbmc.LOGWARNING)
+            break
+
+    utils.crunchy_log(
+        f"fill_season_playlist: {playlist.size()} episodes queued, current at position {current}"
+    )
+
+
 def start_playback():
     """ plays an episode
     """
     video_player = VideoPlayer()
     video_player.start_playback()
+
+    # best effort: queue the rest of the season for next/previous and auto-advance
+    if video_player.stream_data:
+        try:
+            fill_season_playlist(video_player)
+        except Exception as e:
+            utils.crunchy_log(f"fill_season_playlist failed: {e}", xbmc.LOGWARNING)
 
     utils.crunchy_log("Starting loop", xbmc.LOGINFO)
     # stay in this method while playing to not lose video_player, as backgrounds threads reference it

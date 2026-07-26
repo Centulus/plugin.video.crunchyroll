@@ -99,6 +99,10 @@ class VideoPlayer(Object):
         import threading as _threading
         self._playhead_lock = _threading.Lock()
 
+    @property
+    def stream_data(self) -> Optional[VideoPlayerStreamData]:
+        return self._stream_data
+
     def start_playback(self):
         """ Set up player and start playback """
 
@@ -173,6 +177,8 @@ class VideoPlayer(Object):
             if not self._stream_data or not self._stream_data.stream_url:
                 utils.crunchy_log("Failed to load stream info for playback", xbmc.LOGERROR)
                 xbmcplugin.setResolvedUrl(int(G.args.argv[1]), False, item)
+                if xbmc.PlayList(xbmc.PLAYLIST_VIDEO).size() > 1:
+                    return False
                 xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30064))
                 return False
 
@@ -180,17 +186,19 @@ class VideoPlayer(Object):
             utils.log_error_with_trace("Failed to prepare stream info data", False)
             xbmcplugin.setResolvedUrl(int(G.args.argv[1]), False, item)
 
+            # mid-season-playlist: let Kodi skip to the next episode, no blocking popup
+            if xbmc.PlayList(xbmc.PLAYLIST_VIDEO).size() > 1:
+                utils.crunchy_log(f"Skipping unplayable episode in season playlist: {e}", xbmc.LOGWARNING)
+                return False
+
             # check for TOO_MANY_ACTIVE_STREAMS
             if 'TOO_MANY_ACTIVE_STREAMS' in str(e):
                 xbmcgui.Dialog().ok(G.args.addon_name,
                                     G.args.addon.getLocalizedString(30080))
-                playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
-                playlist.clear()
             else:
                 xbmcgui.Dialog().ok(G.args.addon_name,
                                     G.args.addon.getLocalizedString(30064))
-                playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
-                playlist.clear()
+            xbmc.PlayList(xbmc.PLAYLIST_VIDEO).clear()
             return False
 
         return True

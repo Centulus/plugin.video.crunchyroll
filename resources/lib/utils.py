@@ -96,6 +96,25 @@ async def aio_to_thread(func, /, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
+def get_episodes_for_season(season_id: str) -> List[EpisodeData]:
+    """ fetch all episodes of a season in a single request, in API order """
+
+    req = G.api.make_request(
+        method="GET",
+        url=G.api.EPISODES_ENDPOINT.format(G.api.account_data.cms.bucket),
+        params={
+            "locale": G.args.subtitle,
+            "season_id": season_id
+        },
+        timeout=15
+    )
+
+    if not req or "error" in req:
+        return []
+
+    return [item for item in get_listables_from_response(req.get('items')) if isinstance(item, EpisodeData)]
+
+
 async def get_cms_object_data_by_ids(ids: list) -> dict:
     """ fetch info from api object endpoint for given ids. Useful to complement missing data """
 

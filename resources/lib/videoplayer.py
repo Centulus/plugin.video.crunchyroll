@@ -25,7 +25,6 @@ import random
 import xbmc
 import xbmcgui
 import xbmcplugin
-import xbmcvfs
 
 from resources.lib import utils
 from resources.lib.globals import G
@@ -334,7 +333,6 @@ class VideoPlayer(Object):
         if local_mpd:
             item.setPath(local_mpd)
             self._playing_url = local_mpd
-            item.setProperty("inputstream.adaptive.manifest_type", "mpd")
 
         # Keep remote MPD URL; ISA will fetch it using provided headers/cookies
 
@@ -374,12 +372,48 @@ class VideoPlayer(Object):
         if max_res and max_res != "auto":
             item.setProperty("inputstream.adaptive.chooser_resolution_max", max_res)
 
+    # ISA's manifest loader (kodi::vfs::CURLCreate) only accepts http(s), so a
+    # rewritten manifest has to be served back over loopback. One daemon thread
+    # for the whole Kodi session; the payload is swapped per playback.
+    _manifest_httpd = None
+    _manifest_thread = None
+    _manifest_payload = b""
+
+    @classmethod
+    def _serve_manifest(cls, mpd_text: str) -> str:
+        import http.server
+        import threading
+
+        cls._manifest_payload = mpd_text.encode("utf-8")
+        if cls._manifest_thread is None or not cls._manifest_thread.is_alive():
+            class _Handler(http.server.BaseHTTPRequestHandler):
+                def _send(self, with_body):
+                    body = cls._manifest_payload
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/dash+xml")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    if with_body:
+                        self.wfile.write(body)
+
+                do_GET = lambda self: self._send(True)
+                do_HEAD = lambda self: self._send(False)
+                log_message = lambda self, *_: None
+
+            cls._manifest_httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+            cls._manifest_thread = threading.Thread(
+                target=cls._manifest_httpd.serve_forever, name="cr-manifest", daemon=True
+            )
+            cls._manifest_thread.start()
+        return "http://127.0.0.1:%d/manifest.mpd" % cls._manifest_httpd.server_address[1]
+
     def _apply_cdn_override(self, mpd_url: str, headers: dict) -> Optional[str]:
         """Opt-in: swap a flaky CDN host in the manifest before handing it to ISA.
 
-        Returns a local .mpd path to play, or None to keep Crunchyroll's default CDN.
-        One init segment is pre-fetched from the new host first; on any failure the
-        user is notified and playback falls back to the original stream.
+        Returns an http URL serving the rewritten manifest, or None to keep
+        Crunchyroll's default CDN. One init segment is pre-fetched from the new
+        host first; on any failure the user is notified and playback falls back
+        to the original stream.
         """
         if G.args.addon.getSetting("cdn_override") != "true":
             return None
@@ -407,11 +441,9 @@ class VideoPlayer(Object):
             if not pr.ok or not pr.content:
                 raise IOError("preflight HTTP %s" % pr.status_code)
 
-            path = xbmcvfs.translatePath("special://temp/crunchyroll_manifest.mpd")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(mpd)
+            url = self._serve_manifest(mpd)
             utils.crunchy_log("CDN override active: %s -> %s" % (src, dst), xbmc.LOGINFO)
-            return path
+            return url
         except Exception as e:
             utils.crunchy_log("CDN override failed (%s) - using default CDN" % e, xbmc.LOGWARNING)
             xbmcgui.Dialog().notification(

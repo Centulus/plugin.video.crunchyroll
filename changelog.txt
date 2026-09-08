@@ -1,3 +1,7 @@
+v3.6.2 (2026.09.08)
+- CDN override: serve the rewritten manifest over a loopback HTTP endpoint
+  (inputstream.adaptive only loads manifests over http/https)
+
 v3.6.1 (2026.09.08)
 - Streaming settings: optional maximum-resolution cap
 - Streaming settings: optional larger network cache (writes advancedsettings.xml, needs restart)

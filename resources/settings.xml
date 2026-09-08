@@ -164,5 +164,61 @@
                 </setting>
             </group>
         </category>
+        <category id="streaming" label="30310" help="">
+            <group id="1" label="30310">
+                <setting id="max_resolution" type="string" label="30311" help="30312">
+                    <level>0</level>
+                    <default>auto</default>
+                    <constraints>
+                        <options>
+                            <option label="30313">auto</option>
+                            <option label="30314">1080p</option>
+                            <option label="30315">720p</option>
+                            <option label="30316">480p</option>
+                            <option label="30317">360p</option>
+                        </options>
+                    </constraints>
+                    <control type="list" format="string"/>
+                </setting>
+                <setting id="optimize_cache" type="boolean" label="30318" help="30319">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle"/>
+                </setting>
+            </group>
+            <group id="2" label="30320">
+                <setting id="cdn_override" type="boolean" label="30321" help="30322">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle"/>
+                </setting>
+                <setting id="cdn_override_from" parent="cdn_override" type="string" label="30323" help="">
+                    <level>0</level>
+                    <default>vod-gcp.crunchyrollcdn.com</default>
+                    <constraints>
+                        <allowempty>false</allowempty>
+                    </constraints>
+                    <control type="edit" format="string">
+                        <heading>30323</heading>
+                    </control>
+                    <dependencies>
+                        <dependency type="enable" setting="cdn_override">true</dependency>
+                    </dependencies>
+                </setting>
+                <setting id="cdn_override_to" parent="cdn_override" type="string" label="30324" help="">
+                    <level>0</level>
+                    <default>vod-fy-mod.crunchyrollcdn.com</default>
+                    <constraints>
+                        <allowempty>false</allowempty>
+                    </constraints>
+                    <control type="edit" format="string">
+                        <heading>30324</heading>
+                    </control>
+                    <dependencies>
+                        <dependency type="enable" setting="cdn_override">true</dependency>
+                    </dependencies>
+                </setting>
+            </group>
+        </category>
     </section>
 </settings>

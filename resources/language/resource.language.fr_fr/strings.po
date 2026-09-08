@@ -307,3 +307,72 @@ msgstr ""
 msgctxt "#30090"
 msgid "No search results"
 msgstr ""
+
+
+msgctxt "#30310"
+msgid "Streaming"
+msgstr "Streaming"
+
+msgctxt "#30311"
+msgid "Maximum quality"
+msgstr "Qualité maximale"
+
+msgctxt "#30312"
+msgid "Cap the video resolution. 'Automatic' lets Kodi pick the best quality and step down automatically when the connection can't keep up."
+msgstr "Limite la résolution vidéo. « Automatique » laisse Kodi choisir la meilleure qualité et redescendre automatiquement quand la connexion ne suit plus."
+
+msgctxt "#30313"
+msgid "Automatic / maximum (recommended)"
+msgstr "Automatique / maximum (recommandé)"
+
+msgctxt "#30314"
+msgid "1080p"
+msgstr "1080p"
+
+msgctxt "#30315"
+msgid "720p"
+msgstr "720p"
+
+msgctxt "#30316"
+msgid "480p"
+msgstr "480p"
+
+msgctxt "#30317"
+msgid "360p"
+msgstr "360p"
+
+msgctxt "#30318"
+msgid "Enlarge streaming cache"
+msgstr "Agrandir le cache de streaming"
+
+msgctxt "#30319"
+msgid "Write a larger network cache to advancedsettings.xml. Requires a Kodi restart. Reduces stalls when a CDN is slow."
+msgstr "Écrit un cache réseau plus grand dans advancedsettings.xml. Nécessite un redémarrage de Kodi. Réduit les coupures quand un CDN est lent."
+
+msgctxt "#30320"
+msgid "CDN override (advanced)"
+msgstr "Redirection CDN (avancé)"
+
+msgctxt "#30321"
+msgid "Bypass a specific CDN host"
+msgstr "Contourner un hôte CDN précis"
+
+msgctxt "#30322"
+msgid "Rewrite the stream host before playback. Off by default. May stop working without notice if Crunchyroll changes their CDN; a notification is shown each time it falls back."
+msgstr "Réécrit l'hôte du flux avant lecture. Désactivé par défaut. Peut cesser de fonctionner sans préavis si Crunchyroll change de CDN ; une notification s'affiche à chaque repli."
+
+msgctxt "#30323"
+msgid "Replace this host"
+msgstr "Remplacer cet hôte"
+
+msgctxt "#30324"
+msgid "With this host"
+msgstr "Par cet hôte"
+
+msgctxt "#30325"
+msgid "Restart Kodi to apply the new streaming cache size"
+msgstr "Redémarrez Kodi pour appliquer la nouvelle taille de cache"
+
+msgctxt "#30326"
+msgid "CDN override failed, using Crunchyroll's default CDN"
+msgstr "Échec de la redirection CDN, utilisation du CDN par défaut de Crunchyroll"

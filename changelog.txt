@@ -1,3 +1,8 @@
+v3.6.1 (2026.09.08)
+- Streaming settings: optional maximum-resolution cap
+- Streaming settings: optional larger network cache (writes advancedsettings.xml, needs restart)
+- Streaming settings: opt-in CDN host override, auto-falls back to the default CDN with a notification
+
 v3.2.0.1 (2023.12.17)
 - Update for new api
 

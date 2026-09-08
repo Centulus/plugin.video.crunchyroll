@@ -24,6 +24,7 @@ from typing import Dict, Union, List, Optional
 import requests
 import xbmc
 import xbmcgui
+import xbmcvfs
 
 from .globals import G
 from .model import CrunchyrollError, ListableItem, EpisodeData, MovieData, SeriesData, SeasonData
@@ -323,6 +324,66 @@ def log_error_with_trace(message, show_notification: bool = True) -> None:
     except Exception:
         # Swallow any logging/notification errors during teardown
         pass
+
+
+def ensure_streaming_cache_settings() -> None:
+    """Opt-in: give Kodi a larger network cache so a slow/stalling CDN doesn't
+    drain the buffer. Writes advancedsettings.xml and asks for a restart only when
+    it actually changes something, so it's safe to call on every playback.
+    """
+    if G.args.addon.getSetting("optimize_cache") != "true":
+        return
+
+    from xml.etree import ElementTree as ET
+
+    # ~150 MiB forward buffer, refilled at up to 10x realtime, internet streams only
+    wanted = {"buffermode": "1", "memorysize": "157286400", "readfactor": "10"}
+    path = xbmcvfs.translatePath("special://profile/advancedsettings.xml")
+
+    try:
+        if xbmcvfs.exists(path):
+            fh = xbmcvfs.File(path)
+            raw = fh.read()
+            fh.close()
+            root = ET.fromstring(raw) if raw.strip() else ET.Element("advancedsettings")
+        else:
+            root = ET.Element("advancedsettings")
+
+        if root.tag != "advancedsettings":
+            return
+
+        cache = root.find("cache")
+        if cache is None:
+            cache = ET.SubElement(root, "cache")
+
+        changed = False
+        for key, value in wanted.items():
+            node = cache.find(key)
+            if node is None:
+                node = ET.SubElement(cache, key)
+            if (node.text or "").strip() != value:
+                node.text = value
+                changed = True
+
+        if not changed:
+            return
+
+        try:
+            ET.indent(root)  # Python 3.9+ (Kodi 20+); cosmetic only
+        except AttributeError:
+            pass
+        fh = xbmcvfs.File(path, "w")
+        fh.write(ET.tostring(root, encoding="unicode"))
+        fh.close()
+        xbmcgui.Dialog().notification(
+            G.args.addon_name,
+            G.args.addon.getLocalizedString(30325),
+            xbmcgui.NOTIFICATION_INFO,
+            6000
+        )
+    except Exception as e:
+        crunchy_log("ensure_streaming_cache_settings failed: %s" % e, xbmc.LOGWARNING)
+
 
 def filter_series(seriesItem: Dict) -> bool:
     """ takes an API info struct and returns if it matches user language settings """

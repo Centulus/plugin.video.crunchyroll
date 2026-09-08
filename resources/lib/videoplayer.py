@@ -15,6 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 import json
+import re
 import time
 from typing import Optional, List
 from urllib.parse import urlencode
@@ -24,6 +25,7 @@ import random
 import xbmc
 import xbmcgui
 import xbmcplugin
+import xbmcvfs
 
 from resources.lib import utils
 from resources.lib.globals import G
@@ -206,6 +208,8 @@ class VideoPlayer(Object):
     def _prepare_and_start_playback(self):
         """ Sets up the playback"""
 
+        utils.ensure_streaming_cache_settings()
+
         # prepare playback
         # note: when setting only a couple of values to the item, kodi will fetch the remaining from the url args
         #       since we do a full overwrite of the item with data from the cms object, which does not contain all
@@ -324,6 +328,14 @@ class VideoPlayer(Object):
         ]))
         item.setProperty('inputstream.adaptive.config', json.dumps(inputstream_config))
 
+        # Optional streaming tweaks (opt-in via settings)
+        self._apply_stream_quality(item)
+        local_mpd = self._apply_cdn_override(self._stream_data.stream_url, manifest_headers)
+        if local_mpd:
+            item.setPath(local_mpd)
+            self._playing_url = local_mpd
+            item.setProperty("inputstream.adaptive.manifest_type", "mpd")
+
         # Keep remote MPD URL; ISA will fetch it using provided headers/cookies
 
         # @todo: i think other meta data like description and images are still fetched from args.
@@ -353,6 +365,62 @@ class VideoPlayer(Object):
 
         """ start playback"""
         xbmcplugin.setResolvedUrl(int(G.args.argv[1]), True, item)
+
+    @staticmethod
+    def _apply_stream_quality(item) -> None:
+        """Cap the resolution when the user picked one. Default 'auto' keeps ISA's
+        adaptive behaviour: start at the best quality, drop when the line can't follow."""
+        max_res = (G.args.addon.getSetting("max_resolution") or "auto").strip()
+        if max_res and max_res != "auto":
+            item.setProperty("inputstream.adaptive.chooser_resolution_max", max_res)
+
+    def _apply_cdn_override(self, mpd_url: str, headers: dict) -> Optional[str]:
+        """Opt-in: swap a flaky CDN host in the manifest before handing it to ISA.
+
+        Returns a local .mpd path to play, or None to keep Crunchyroll's default CDN.
+        One init segment is pre-fetched from the new host first; on any failure the
+        user is notified and playback falls back to the original stream.
+        """
+        if G.args.addon.getSetting("cdn_override") != "true":
+            return None
+        src = (G.args.addon.getSetting("cdn_override_from") or "").strip()
+        dst = (G.args.addon.getSetting("cdn_override_to") or "").strip()
+        if not src or not dst or src == dst:
+            return None
+
+        try:
+            resp = requests.get(mpd_url, headers=headers, timeout=10)
+            if not resp.ok or ("//" + src + "/") not in resp.text:
+                # manifest unreachable or not on the targeted CDN - nothing to do
+                return None
+            mpd = resp.text.replace("//" + src + "/", "//" + dst + "/")
+
+            # pre-flight: first init segment must load from the new host
+            base = re.search(r"<BaseURL>\s*(https?://[^<]+?)\s*</BaseURL>", mpd)
+            init = re.search(r'initialization="([^"]+)"', mpd)
+            rep = re.search(r'<Representation[^>]*\bid="([^"]+)"', mpd)
+            if not (base and init and rep):
+                raise ValueError("unexpected manifest layout")
+            probe = base.group(1) + init.group(1).replace("$RepresentationID$", rep.group(1))
+            probe_headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+            pr = requests.get(probe, headers=probe_headers, timeout=6)
+            if not pr.ok or not pr.content:
+                raise IOError("preflight HTTP %s" % pr.status_code)
+
+            path = xbmcvfs.translatePath("special://temp/crunchyroll_manifest.mpd")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(mpd)
+            utils.crunchy_log("CDN override active: %s -> %s" % (src, dst), xbmc.LOGINFO)
+            return path
+        except Exception as e:
+            utils.crunchy_log("CDN override failed (%s) - using default CDN" % e, xbmc.LOGWARNING)
+            xbmcgui.Dialog().notification(
+                G.args.addon_name,
+                G.args.addon.getLocalizedString(30326),
+                xbmcgui.NOTIFICATION_WARNING,
+                4000
+            )
+            return None
 
     def _safe_playhead(self, seconds: int) -> int:
         """Clamp playhead to a safe range [0, duration-1] to avoid overshoots/completions."""

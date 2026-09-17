@@ -239,7 +239,11 @@ class VideoPlayer(Object):
             Helper = None  # type: ignore
 
         is_helper = Helper("mpd", drm='com.widevine.alpha') if Helper else None
-        #if is_helper.check_inputstream():
+        if is_helper and not is_helper.check_inputstream():
+            xbmcplugin.setResolvedUrl(int(G.args.argv[1]), False, item)
+            xbmcgui.Dialog().ok(G.args.addon_name, G.args.addon.getLocalizedString(30064))
+            return
+
         manifest_headers = {
             # Match Android TV okhttp behavior for MPD fetch - minimal headers only
             'Authorization': f"Bearer {G.api.account_data.access_token}"

@@ -1,3 +1,8 @@
+v3.6.3 (2026.09.17)
+- License requests (including Widevine renewals) now go through a loopback
+  proxy that keeps the access token fresh, fixing playback exiting after a
+  long pause/background
+
 v3.6.2 (2026.09.08)
 - CDN override: serve the rewritten manifest over a loopback HTTP endpoint
   (inputstream.adaptive only loads manifests over http/https)

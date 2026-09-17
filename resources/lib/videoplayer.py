@@ -310,6 +310,9 @@ class VideoPlayer(Object):
         license_headers_str = urlencode(license_headers)
         # Update license config with updated headers
         license_config['headers'] = license_headers_str
+        # Route license requests (incl. ISA's own renewals) through the loopback
+        # proxy so they always carry a live token instead of today's snapshot
+        license_config['license_server_url'] = "http://127.0.0.1:%d/license" % self._ensure_local_proxy()
 
         inputstream_config = {
             'ssl_verify_peer': False
@@ -372,40 +375,73 @@ class VideoPlayer(Object):
         if max_res and max_res != "auto":
             item.setProperty("inputstream.adaptive.chooser_resolution_max", max_res)
 
-    # ISA's manifest loader (kodi::vfs::CURLCreate) only accepts http(s), so a
-    # rewritten manifest has to be served back over loopback. One daemon thread
-    # for the whole Kodi session; the payload is swapped per playback.
-    _manifest_httpd = None
-    _manifest_thread = None
+    # ISA freezes its license/manifest headers at Open() and never re-reads them,
+    # so a stale token breaks license renewal after a long pause - proxy it.
+    _proxy_httpd = None
+    _proxy_thread = None
+    _proxy_lock = None
     _manifest_payload = b""
 
     @classmethod
-    def _serve_manifest(cls, mpd_text: str) -> str:
+    def _ensure_local_proxy(cls) -> int:
         import http.server
         import threading
 
+        if cls._proxy_lock is None:
+            cls._proxy_lock = threading.Lock()
+        if cls._proxy_thread is not None and cls._proxy_thread.is_alive():
+            return cls._proxy_httpd.server_address[1]
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def _reply(self, code, ctype, body):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                self._reply(200, "application/dash+xml", cls._manifest_payload)
+
+            def do_HEAD(self):
+                self._reply(200, "application/dash+xml", b"")
+
+            def do_POST(self):
+                if self.path != "/license":
+                    self.send_response(404); self.end_headers(); return
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")}
+                headers["Authorization"] = "Bearer " + cls._fresh_access_token()
+                r = requests.post(G.api.LICENSE_ENDPOINT, headers=headers, data=body, timeout=20)
+                self._reply(r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content)
+
+            def log_message(self, *_):
+                pass
+
+        cls._proxy_httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        cls._proxy_thread = threading.Thread(
+            target=cls._proxy_httpd.serve_forever, name="cr-local-proxy", daemon=True
+        )
+        cls._proxy_thread.start()
+        return cls._proxy_httpd.server_address[1]
+
+    @classmethod
+    def _fresh_access_token(cls) -> str:
+        """Refresh the session if the access token is stale."""
+        from .api import get_date, str_to_date
+        with cls._proxy_lock:
+            try:
+                expires = G.api.account_data.expires
+                if not expires or (str_to_date(expires) - get_date()).total_seconds() < 30:
+                    G.api.create_session(action="refresh")
+            except Exception as e:
+                utils.crunchy_log("license proxy: token refresh failed: %s" % e, xbmc.LOGWARNING)
+        return G.api.account_data.access_token
+
+    @classmethod
+    def _serve_manifest(cls, mpd_text: str) -> str:
         cls._manifest_payload = mpd_text.encode("utf-8")
-        if cls._manifest_thread is None or not cls._manifest_thread.is_alive():
-            class _Handler(http.server.BaseHTTPRequestHandler):
-                def _send(self, with_body):
-                    body = cls._manifest_payload
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/dash+xml")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    if with_body:
-                        self.wfile.write(body)
-
-                do_GET = lambda self: self._send(True)
-                do_HEAD = lambda self: self._send(False)
-                log_message = lambda self, *_: None
-
-            cls._manifest_httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-            cls._manifest_thread = threading.Thread(
-                target=cls._manifest_httpd.serve_forever, name="cr-manifest", daemon=True
-            )
-            cls._manifest_thread.start()
-        return "http://127.0.0.1:%d/manifest.mpd" % cls._manifest_httpd.server_address[1]
+        return "http://127.0.0.1:%d/manifest.mpd" % cls._ensure_local_proxy()
 
     def _apply_cdn_override(self, mpd_url: str, headers: dict) -> Optional[str]:
         """Opt-in: swap a flaky CDN host in the manifest before handing it to ISA.

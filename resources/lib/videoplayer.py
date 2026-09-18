@@ -18,7 +18,7 @@ import json
 import re
 import time
 from typing import Optional, List
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit, parse_qsl
 
 import requests
 import random
@@ -336,12 +336,9 @@ class VideoPlayer(Object):
 
         # Optional streaming tweaks (opt-in via settings)
         self._apply_stream_quality(item)
-        local_mpd = self._apply_cdn_override(self._stream_data.stream_url, manifest_headers)
-        if local_mpd:
-            item.setPath(local_mpd)
-            self._playing_url = local_mpd
-
-        # Keep remote MPD URL; ISA will fetch it using provided headers/cookies
+        local_mpd = self._prepare_local_manifest(self._stream_data.stream_url, manifest_headers)
+        item.setPath(local_mpd)
+        self._playing_url = local_mpd
 
         # @todo: i think other meta data like description and images are still fetched from args.
         #        we should call the objects endpoint and use this data to remove args dependency (besides id)
@@ -379,12 +376,16 @@ class VideoPlayer(Object):
         if max_res and max_res != "auto":
             item.setProperty("inputstream.adaptive.chooser_resolution_max", max_res)
 
-    # ISA freezes its license/manifest headers at Open() and never re-reads them,
-    # so a stale token breaks license renewal after a long pause - proxy it.
+    # ISA freezes manifest/license/segment URLs at Open() and never re-reads
+    # them, so anything time-limited in them breaks after a long pause: the
+    # license bearer, and each segment's own signed-URL expiry. Both get
+    # healed transparently by routing them through this loopback proxy.
     _proxy_httpd = None
     _proxy_thread = None
     _proxy_lock = None
     _manifest_payload = b""
+    _manifest_ctx = {}    # acl -> (mpd_url, headers), to refresh a stale segment token
+    _token_cache = {}      # acl -> (token, exp)
 
     @classmethod
     def _ensure_local_proxy(cls) -> int:
@@ -392,7 +393,7 @@ class VideoPlayer(Object):
         import threading
 
         if cls._proxy_lock is None:
-            cls._proxy_lock = threading.Lock()
+            cls._proxy_lock = threading.RLock()
         if cls._proxy_thread is not None and cls._proxy_thread.is_alive():
             return cls._proxy_httpd.server_address[1]
 
@@ -405,10 +406,27 @@ class VideoPlayer(Object):
                 self.wfile.write(body)
 
             def do_GET(self):
+                if self.path.startswith("/seg/"):
+                    return self._relay_segment()
                 self._reply(200, "application/dash+xml", cls._manifest_payload)
 
             def do_HEAD(self):
                 self._reply(200, "application/dash+xml", b"")
+
+            def _relay_segment(self):
+                p = urlsplit(self.path)
+                real_path = p.path[len("/seg/"):]
+                token = dict(parse_qsl(p.query)).get("t", "")
+                exp, acl = cls._parse_token(token)
+                if exp and exp - time.time() < 30:
+                    token = cls._refresh_segment_token(acl) or token
+                url = "https://" + real_path + ("?t=" + token if token else "")
+                try:
+                    r = requests.get(url, timeout=20)
+                    self._reply(r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content)
+                except Exception:
+                    self.send_response(502)
+                    self.end_headers()
 
             def do_POST(self):
                 if self.path != "/license":
@@ -442,37 +460,102 @@ class VideoPlayer(Object):
                 utils.crunchy_log("license proxy: token refresh failed: %s" % e, xbmc.LOGWARNING)
         return G.api.account_data.access_token
 
+    @staticmethod
+    def _parse_token(token: str):
+        """Split a Fastly-style 'exp=…~acl=…~hmac=…' token into (exp, acl)."""
+        if not token.startswith("exp="):
+            return 0, ""
+        parts = dict(p.split("=", 1) for p in token.split("~") if "=" in p)
+        try:
+            return int(parts.get("exp", 0)), parts.get("acl", "")
+        except ValueError:
+            return 0, ""
+
+    @classmethod
+    def _refresh_segment_token(cls, acl: str) -> Optional[str]:
+        """Re-fetch the manifest for this asset and pull a fresh signed token.
+        The token's acl is a directory glob, so one fresh token re-authorizes
+        every segment/representation under it - no need to match per file."""
+        if not acl:
+            return None
+        with cls._proxy_lock:
+            cached = cls._token_cache.get(acl)
+            if cached and cached[1] - time.time() > 30:
+                return cached[0]
+            ctx = cls._manifest_ctx.get(acl)
+            if not ctx:
+                return cached[0] if cached else None
+            mpd_url, headers = ctx
+            headers = dict(headers)
+            headers["Authorization"] = "Bearer " + cls._fresh_access_token()
+            try:
+                r = requests.get(mpd_url, headers=headers, timeout=10)
+                m = re.search(r'[?&]t=(exp=[^"&]+)', r.text) if r.ok else None
+            except Exception:
+                m = None
+            if not m:
+                return cached[0] if cached else None
+            token = m.group(1)
+            cls._token_cache[acl] = (token, cls._parse_token(token)[0])
+            return token
+
+    @classmethod
+    def _register_segment_source(cls, acl: str, mpd_url: str, headers: dict) -> None:
+        cls._manifest_ctx[acl] = (mpd_url, dict(headers))
+
+    @staticmethod
+    def _to_loopback(url: str, port: int) -> str:
+        p = urlsplit(url)
+        return "http://127.0.0.1:%d/seg/%s%s" % (port, p.netloc, p.path)
+
     @classmethod
     def _serve_manifest(cls, mpd_text: str) -> str:
         cls._manifest_payload = mpd_text.encode("utf-8")
         return "http://127.0.0.1:%d/manifest.mpd" % cls._ensure_local_proxy()
 
-    def _apply_cdn_override(self, mpd_url: str, headers: dict) -> Optional[str]:
-        """Opt-in: swap a flaky CDN host in the manifest before handing it to ISA.
-
-        Returns an http URL serving the rewritten manifest, or None to keep
-        Crunchyroll's default CDN. One init segment is pre-fetched from the new
-        host first; on any failure the user is notified and playback falls back
-        to the original stream.
+    def _prepare_local_manifest(self, mpd_url: str, headers: dict) -> str:
+        """Fetch the manifest and route every segment it points to through the
+        loopback proxy, so a signed-segment token that goes stale during a long
+        pause is refreshed transparently instead of stalling playback. Falls
+        back to the original remote URL if the manifest can't be fetched.
         """
-        if G.args.addon.getSetting("cdn_override") != "true":
-            return None
-        src = (G.args.addon.getSetting("cdn_override_from") or "").strip()
-        dst = (G.args.addon.getSetting("cdn_override_to") or "").strip()
-        if not src or not dst or src == dst:
-            return None
-
         try:
             resp = requests.get(mpd_url, headers=headers, timeout=10)
-            if not resp.ok or ("//" + src + "/") not in resp.text:
-                # manifest unreachable or not on the targeted CDN - nothing to do
-                return None
-            mpd = resp.text.replace("//" + src + "/", "//" + dst + "/")
+            if not resp.ok:
+                return mpd_url
+            mpd = self._maybe_swap_cdn_host(resp.text, headers)
 
-            # pre-flight: first init segment must load from the new host
-            base = re.search(r"<BaseURL>\s*(https?://[^<]+?)\s*</BaseURL>", mpd)
-            init = re.search(r'initialization="([^"]+)"', mpd)
-            rep = re.search(r'<Representation[^>]*\bid="([^"]+)"', mpd)
+            m = re.search(r'[?&]t=(exp=[^"&]+)', mpd)
+            if m:
+                acl = dict(p.split("=", 1) for p in m.group(1).split("~") if "=" in p).get("acl", "")
+                if acl:
+                    self._register_segment_source(acl, mpd_url, headers)
+
+            port = self._ensure_local_proxy()
+            mpd = re.sub(
+                r"<BaseURL>\s*(https?://[^<]+?)\s*</BaseURL>",
+                lambda mo: "<BaseURL>%s</BaseURL>" % self._to_loopback(mo.group(1), port),
+                mpd,
+            )
+            return self._serve_manifest(mpd)
+        except Exception as e:
+            utils.crunchy_log("manifest proxy setup failed (%s) - using default stream" % e, xbmc.LOGWARNING)
+            return mpd_url
+
+    def _maybe_swap_cdn_host(self, mpd: str, headers: dict) -> str:
+        """Opt-in: swap a flaky CDN host. Reverts and notifies the user if the
+        replacement host doesn't actually serve the content."""
+        if G.args.addon.getSetting("cdn_override") != "true":
+            return mpd
+        src = (G.args.addon.getSetting("cdn_override_from") or "").strip()
+        dst = (G.args.addon.getSetting("cdn_override_to") or "").strip()
+        if not src or not dst or src == dst or ("//" + src + "/") not in mpd:
+            return mpd
+        swapped = mpd.replace("//" + src + "/", "//" + dst + "/")
+        try:
+            base = re.search(r"<BaseURL>\s*(https?://[^<]+?)\s*</BaseURL>", swapped)
+            init = re.search(r'initialization="([^"]+)"', swapped)
+            rep = re.search(r'<Representation[^>]*\bid="([^"]+)"', swapped)
             if not (base and init and rep):
                 raise ValueError("unexpected manifest layout")
             probe = base.group(1) + init.group(1).replace("$RepresentationID$", rep.group(1))
@@ -480,19 +563,14 @@ class VideoPlayer(Object):
             pr = requests.get(probe, headers=probe_headers, timeout=6)
             if not pr.ok or not pr.content:
                 raise IOError("preflight HTTP %s" % pr.status_code)
-
-            url = self._serve_manifest(mpd)
-            utils.crunchy_log("CDN override active: %s -> %s" % (src, dst), xbmc.LOGINFO)
-            return url
         except Exception as e:
             utils.crunchy_log("CDN override failed (%s) - using default CDN" % e, xbmc.LOGWARNING)
             xbmcgui.Dialog().notification(
-                G.args.addon_name,
-                G.args.addon.getLocalizedString(30326),
-                xbmcgui.NOTIFICATION_WARNING,
-                4000
+                G.args.addon_name, G.args.addon.getLocalizedString(30326), xbmcgui.NOTIFICATION_WARNING, 4000
             )
-            return None
+            return mpd
+        utils.crunchy_log("CDN override active: %s -> %s" % (src, dst), xbmc.LOGINFO)
+        return swapped
 
     def _safe_playhead(self, seconds: int) -> int:
         """Clamp playhead to a safe range [0, duration-1] to avoid overshoots/completions."""

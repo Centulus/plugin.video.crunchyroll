@@ -14,6 +14,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+import base64
+import html
 import json
 import re
 import time
@@ -384,8 +386,8 @@ class VideoPlayer(Object):
     _proxy_thread = None
     _proxy_lock = None
     _manifest_payload = b""
-    _manifest_ctx = {}    # acl -> (mpd_url, headers), to refresh a stale segment token
-    _token_cache = {}      # acl -> (token, exp)
+    _manifest_ctx = {}    # key -> (mpd_url, headers, episode_id), to refresh a stale signed query
+    _token_cache = {}      # key -> (query, exp)
 
     @classmethod
     def _ensure_local_proxy(cls) -> int:
@@ -398,10 +400,12 @@ class VideoPlayer(Object):
             return cls._proxy_httpd.server_address[1]
 
         class _Handler(http.server.BaseHTTPRequestHandler):
-            def _reply(self, code, ctype, body):
+            def _reply(self, code, ctype, body, extra=()):
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                for k, v in extra:
+                    self.send_header(k, v)
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -415,15 +419,18 @@ class VideoPlayer(Object):
 
             def _relay_segment(self):
                 p = urlsplit(self.path)
-                real_path = p.path[len("/seg/"):]
-                token = dict(parse_qsl(p.query)).get("t", "")
-                exp, acl = cls._parse_token(token)
+                query = p.query
+                exp, key = cls._query_expiry(query)
                 if exp and exp - time.time() < 30:
-                    token = cls._refresh_segment_token(acl) or token
-                url = "https://" + real_path + ("?t=" + token if token else "")
+                    query = cls._refresh_signed_query(key) or query
+                url = "https://" + p.path[len("/seg/"):] + ("?" + query if query else "")
+                headers = {"Accept-Encoding": "identity"}
+                if self.headers.get("Range"):
+                    headers["Range"] = self.headers["Range"]
                 try:
-                    r = requests.get(url, timeout=20)
-                    self._reply(r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content)
+                    r = requests.get(url, headers=headers, timeout=20)
+                    extra = [(h, r.headers[h]) for h in ("Content-Range", "Accept-Ranges") if h in r.headers]
+                    self._reply(r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content, extra)
                 except Exception:
                     self.send_response(502)
                     self.end_headers()
@@ -435,6 +442,17 @@ class VideoPlayer(Object):
                 headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")}
                 headers["Authorization"] = "Bearer " + cls._fresh_access_token()
                 r = requests.post(G.api.LICENSE_ENDPOINT, headers=headers, data=body, timeout=20)
+                episode_id = self.headers.get("x-cr-content-id")
+                if r.status_code == 401 and episode_id:
+                    # video token dead with its session: retry once on a throwaway one
+                    pb = cls._new_session(episode_id)
+                    if pb and pb.get("token"):
+                        try:
+                            headers = {k: v for k, v in headers.items() if k.lower() != "x-cr-video-token"}
+                            headers["x-cr-video-token"] = pb["token"]
+                            r = requests.post(G.api.LICENSE_ENDPOINT, headers=headers, data=body, timeout=20)
+                        finally:
+                            cls._release_session(episode_id, pb["token"])
                 self._reply(r.status_code, r.headers.get("Content-Type", "application/octet-stream"), r.content)
 
             def log_message(self, *_):
@@ -461,52 +479,98 @@ class VideoPlayer(Object):
         return G.api.account_data.access_token
 
     @staticmethod
-    def _parse_token(token: str):
-        """Split a Fastly-style 'exp=…~acl=…~hmac=…' token into (exp, acl)."""
-        if not token.startswith("exp="):
-            return 0, ""
-        parts = dict(p.split("=", 1) for p in token.split("~") if "=" in p)
+    def _query_expiry(query: str):
+        """(exp, key) of a signed CDN query: Fastly 't=exp=..~acl=..' or CloudFront 'Policy=..'."""
+        q = dict(parse_qsl(query))
         try:
-            return int(parts.get("exp", 0)), parts.get("acl", "")
-        except ValueError:
-            return 0, ""
+            if q.get("t", "").startswith("exp="):
+                parts = dict(p.split("=", 1) for p in q["t"].split("~") if "=" in p)
+                return int(parts["exp"]), parts.get("acl", "")
+            if "Policy" in q:
+                st = json.loads(base64.b64decode(q["Policy"].translate(str.maketrans("-_~", "+=/"))))["Statement"][0]
+                return int(st["Condition"]["DateLessThan"]["AWS:EpochTime"]), st["Resource"]
+        except Exception:
+            pass
+        return 0, ""
 
     @classmethod
-    def _refresh_segment_token(cls, acl: str) -> Optional[str]:
-        """Re-fetch the manifest for this asset and pull a fresh signed token.
-        The token's acl is a directory glob, so one fresh token re-authorizes
-        every segment/representation under it - no need to match per file."""
-        if not acl:
+    def _signed_queries(cls, mpd: str) -> dict:
+        """key -> query for every signed CDN query found in a manifest."""
+        found = {}
+        for raw in re.findall(r'\?((?:t=exp=|Policy=)[^"<]+)', mpd):
+            query = html.unescape(raw)
+            found.setdefault(cls._query_expiry(query)[1], query)
+        found.pop("", None)
+        return found
+
+    @classmethod
+    def _queries_from_manifest(cls, url: str, headers: dict) -> dict:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            return cls._signed_queries(r.text) if r.ok else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _new_session(episode_id: str) -> Optional[dict]:
+        """Throwaway playback session, for when the original one has expired."""
+        try:
+            return G.api.request_playback_v2(episode_id, G.api.account_data.default_audio_language)
+        except Exception:
             return None
+
+    @staticmethod
+    def _release_session(episode_id: str, token: str) -> None:
+        try:
+            G.api.make_request(method="DELETE", timeout=10,
+                               url=G.api.STREAMS_ENDPOINT_CLEAR_STREAM.format(episode_id, token))
+        except Exception:
+            pass
+
+    @classmethod
+    def _refresh_signed_query(cls, key: str) -> Optional[str]:
+        """Get a fresh signed query for this key. It's a directory glob, so one
+        covers every file under it, and it's stateless: it stays valid after the
+        session that minted it is released."""
         with cls._proxy_lock:
-            cached = cls._token_cache.get(acl)
+            cached = cls._token_cache.get(key)
             if cached and cached[1] - time.time() > 30:
                 return cached[0]
-            ctx = cls._manifest_ctx.get(acl)
+            ctx = cls._manifest_ctx.get(key)
             if not ctx:
                 return cached[0] if cached else None
-            mpd_url, headers = ctx
-            headers = dict(headers)
-            headers["Authorization"] = "Bearer " + cls._fresh_access_token()
-            try:
-                r = requests.get(mpd_url, headers=headers, timeout=10)
-                m = re.search(r'[?&]t=(exp=[^"&]+)', r.text) if r.ok else None
-            except Exception:
-                m = None
-            if not m:
+            mpd_url, headers, episode_id = ctx
+            headers = dict(headers, Authorization="Bearer " + cls._fresh_access_token())
+            queries = cls._queries_from_manifest(mpd_url, headers)
+            if key not in queries:
+                # session expired server-side (~6h): mint a throwaway one, take its query
+                cls._release_session(episode_id, headers.get("x-cr-video-token", ""))
+                pb = cls._new_session(episode_id)
+                if pb and pb.get("token"):
+                    try:
+                        path = urlsplit(mpd_url).path
+                        urls = [pb.get("url")] + [v.get("url") for v in (pb.get("hardSubs") or {}).values()]
+                        url = next((u for u in urls if u and urlsplit(u).path == path), None)
+                        if url:
+                            queries = cls._queries_from_manifest(url, dict(headers, **{"x-cr-video-token": pb["token"]}))
+                    finally:
+                        cls._release_session(episode_id, pb["token"])
+            if key not in queries:
+                xbmc.log("[PLUGIN] Crunchyroll: signed query refresh failed", xbmc.LOGWARNING)
                 return cached[0] if cached else None
-            token = m.group(1)
-            cls._token_cache[acl] = (token, cls._parse_token(token)[0])
-            return token
+            for k, q in queries.items():
+                cls._token_cache[k] = (q, cls._query_expiry(q)[0])
+            return queries[key]
 
     @classmethod
-    def _register_segment_source(cls, acl: str, mpd_url: str, headers: dict) -> None:
-        cls._manifest_ctx[acl] = (mpd_url, dict(headers))
+    def _register_segment_source(cls, mpd: str, mpd_url: str, headers: dict, episode_id: str) -> None:
+        for key in cls._signed_queries(mpd):
+            cls._manifest_ctx[key] = (mpd_url, dict(headers), episode_id)
 
     @staticmethod
     def _to_loopback(url: str, port: int) -> str:
         p = urlsplit(url)
-        return "http://127.0.0.1:%d/seg/%s%s" % (port, p.netloc, p.path)
+        return "http://127.0.0.1:%d/seg/%s%s%s" % (port, p.netloc, p.path, "?" + p.query if p.query else "")
 
     @classmethod
     def _serve_manifest(cls, mpd_text: str) -> str:
@@ -525,11 +589,7 @@ class VideoPlayer(Object):
                 return mpd_url
             mpd = self._maybe_swap_cdn_host(resp.text, headers)
 
-            m = re.search(r'[?&]t=(exp=[^"&]+)', mpd)
-            if m:
-                acl = dict(p.split("=", 1) for p in m.group(1).split("~") if "=" in p).get("acl", "")
-                if acl:
-                    self._register_segment_source(acl, mpd_url, headers)
+            self._register_segment_source(mpd, mpd_url, headers, G.args.get_arg('episode_id'))
 
             port = self._ensure_local_proxy()
             mpd = re.sub(

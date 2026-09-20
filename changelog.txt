@@ -1,3 +1,9 @@
+v3.6.7 (2026.09.20)
+- Reload the episode at the same position on resume once its 6h DRM license
+  expires (the license cannot be renewed)
+- Fix playhead being written to the wrong episode after switching episodes
+- Season playlist entries keep their watched state
+
 v3.6.6 (2026.09.19)
 - Fix playback of CloudFront-signed and byte-range (SegmentBase) titles
 - Heal segment tokens and licenses after the playback session expired

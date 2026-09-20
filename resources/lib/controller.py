@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import asyncio
 import json
 import math
 
@@ -536,6 +537,9 @@ def fill_season_playlist(video_player: VideoPlayer):
     if current is None:
         return
 
+    # the season endpoint lacks playheads, without them every queued item shows as unwatched
+    asyncio.run(view.complement_listables(episodes))
+
     def play_url(ep):
         # must match the listing URLs, else the local playcount breaks
         return "%s/video/%s/%s/%s" % (G.args.addonurl, ep.series_id, ep.episode_id, ep.stream_id)
@@ -577,13 +581,26 @@ def start_playback():
 
     utils.crunchy_log("Starting loop", xbmc.LOGINFO)
     # stay in this method while playing to not lose video_player, as backgrounds threads reference it
+    reopen = False
     while (not G.monitor.abortRequested()) and video_player.isStartingOrPlaying():
+        if video_player.license_expiring():
+            reopen = True
+            break
         video_player.check_skipping()
         if G.args.addon.getSetting("sync_playtime") == "true":
             utils.crunchy_log("Calling update_playhead from main loop", xbmc.LOGDEBUG)
             video_player.update_playhead()
         G.monitor.waitForAbort(1)
     video_player.finished()
+
+    if reopen and not VideoPlayer.is_busy():
+        # license can't be renewed: reopen the same playlist entry, resumes at the posted playhead
+        utils.crunchy_log("License nearly expired, reopening episode", xbmc.LOGINFO)
+        xbmc.executeJSONRPC(json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "Player.Open",
+            "params": {"item": {"playlistid": xbmc.PLAYLIST_VIDEO,
+                                "position": xbmc.PlayList(xbmc.PLAYLIST_VIDEO).getposition()}}}))
+
     del video_player
 
 

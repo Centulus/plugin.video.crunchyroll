@@ -34,6 +34,9 @@ from resources.lib.gui import SkipModalDialog, show_modal_dialog
 from resources.lib.model import Object, CrunchyrollError, LoginError
 from resources.lib.videostream import VideoPlayerStreamData, VideoStream
 
+# Widevine license is not renewable and lasts 21598s
+LICENSE_MAX_AGE = 5 * 3600 + 50 * 60
+
 
 class CrunchyPlayer(xbmc.Player):
     """Custom player to capture playback events for immediate playhead updates."""
@@ -121,14 +124,37 @@ class VideoPlayer(Object):
 
         self._prepare_and_start_playback()
 
+    def _is_mine(self) -> bool:
+        """ True while Kodi plays this script's episode, not another one queued after it """
+        try:
+            if not self._player.isPlaying():
+                return True
+            playing = xbmc.getInfoLabel('Player.Filenameandpath') + self._player.getPlayingFile()
+        except Exception:
+            return True
+        return any(k and k in playing for k in (G.args.get_arg('episode_id'), self._playing_url))
+
     def isPlaying(self) -> bool:
         if not self._stream_data or not self._player:
             return False
-        # Rely on Kodi's state; comparing paths is unreliable (plugin:// vs local proxy)
         try:
-            return bool(self._player.isPlayingVideo())
+            return bool(self._player.isPlayingVideo()) and self._is_mine()
         except Exception:
             return False
+
+    @staticmethod
+    def is_busy() -> bool:
+        """ True while Kodi is opening another item, opening one on top of it crashes Kodi """
+        return bool(xbmc.getCondVisibility('Window.IsActive(busydialog) | Window.IsActive(busydialognocancel)'))
+
+    def license_expiring(self) -> bool:
+        """ True on resume once the non-renewable ~6h Widevine license is nearly spent """
+        if time.time() - self.createTime < LICENSE_MAX_AGE:
+            return False
+        if not self.isPlaying() or self.is_paused() or self.is_busy():
+            return False
+        self.lastKnownTime = self._safe_playhead(int(self._player.getTime()))
+        return True
 
     def isStartingOrPlaying(self) -> bool:
         """ Returns true if playback is running. Note that it also returns true when paused. """
@@ -138,7 +164,7 @@ class VideoPlayer(Object):
 
         # Consider paused state as active playback for our loop
         try:
-            if xbmc.getCondVisibility('Player.Paused'):
+            if xbmc.getCondVisibility('Player.Paused') and self._is_mine():
                 self.waitForStart = False
                 return True
         except Exception:
@@ -161,10 +187,9 @@ class VideoPlayer(Object):
             self.waitForStart = False
             # Send final playhead update on finish to capture last position
             try:
-                if self._player and self._player.isPlayingVideo():
-                    final_pos = self._safe_playhead(int(self._player.getTime()))
-                    if final_pos >= 10:
-                        update_playhead(G.args.get_arg('episode_id'), final_pos)
+                final_pos = self._safe_playhead(int(self.lastKnownTime))
+                if final_pos >= 10:
+                    update_playhead(G.args.get_arg('episode_id'), final_pos)
             except Exception:
                 pass
             self.clear_active_stream()
@@ -316,8 +341,8 @@ class VideoPlayer(Object):
         license_headers_str = urlencode(license_headers)
         # Update license config with updated headers
         license_config['headers'] = license_headers_str
-        # Route license requests (incl. ISA's own renewals) through the loopback
-        # proxy so they always carry a live token instead of today's snapshot
+        # Route license requests through the loopback proxy so they carry a
+        # live token instead of the one frozen at Open()
         license_config['license_server_url'] = "http://127.0.0.1:%d/license" % self._ensure_local_proxy()
 
         inputstream_config = {
@@ -443,6 +468,7 @@ class VideoPlayer(Object):
                 headers["Authorization"] = "Bearer " + cls._fresh_access_token()
                 r = requests.post(G.api.LICENSE_ENDPOINT, headers=headers, data=body, timeout=20)
                 episode_id = self.headers.get("x-cr-content-id")
+                xbmc.log("[Crunchyroll] license proxy: %s" % r.status_code, xbmc.LOGINFO)
                 if r.status_code == 401 and episode_id:
                     # video token dead with its session: retry once on a throwaway one
                     pb = cls._new_session(episode_id)
@@ -805,6 +831,8 @@ class VideoPlayer(Object):
             return self._paused
 
     def _on_started(self):
+        if not self._is_mine():
+            return
         try:
             current = int(self._player.getTime()) if self._player else 0
             current = self._safe_playhead(current)
@@ -838,6 +866,8 @@ class VideoPlayer(Object):
             pass
 
     def _on_seek(self, new_time: Optional[int] = None):
+        if not self._is_mine():
+            return
         try:
             # Prefer the time provided by the event when available
             if new_time is not None:

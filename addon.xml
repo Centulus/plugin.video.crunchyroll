@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.crunchyroll" name="Crunchyroll" version="3.6.6" provider-name="smirgol">
+<addon id="plugin.video.crunchyroll" name="Crunchyroll" version="3.6.7" provider-name="smirgol">
     <requires>
         <import addon="xbmc.python" version="3.0.1"/>
         <import addon="script.module.inputstreamhelper" version="0.3.3"/>
@@ -22,6 +22,7 @@
         <disclaimer lang="de_DE">HINWEIS: Du MUSST PREMIUM Mitglied sein um dieses Plugin zu benutzen</disclaimer>
         <disclaimer lang="es_ES">Atención: Necesitas ser miembro PREMIUM para utilizar este Plugin</disclaimer>
         <news>
+            v3.6.7 (2026.09.20) - reload playback on resume once the 6h DRM license expires, fix playhead written to the wrong episode, season playlist keeps watched state
             v3.6.6 (2026.09.19) - fix playback of CloudFront-signed and byte-range titles, heal expired sessions
             v3.6.5 (2026.09.18) - segments now route through the loopback proxy too, healing an expired CDN segment token instead of stalling playback
             v3.6.4 (2026.09.17) - require inputstream.adaptive and run its install/DRM check before playback

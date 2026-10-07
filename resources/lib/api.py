@@ -43,6 +43,7 @@ class API:
     # TIMEOUT = 30
 
     # Dynamic client configuration loaded from latest.json
+    CLIENT_CONFIG_FALLBACK_URL = "https://snips.sh/f/9m2U0qx55G/n/crunchyaddon-2?r=1"
     CRUNCHYROLL_UA = ""
     UA_MOBILE = ""
     UA_ATV = ""
@@ -305,13 +306,23 @@ class API:
 
     def _load_client_config(self) -> None:
         """Load dynamic client configuration from latest.json setting."""
-        latest_url = G.args.addon.getSetting("latest_json_url") or "https://reroll.is-cool.dev/latest.json"
-        utils.crunchy_log(f"Loading client config from: {latest_url}")
-        
+        # try the configured url first, then the fallback mirror
+        cfg = None
+        for url in (G.args.addon.getSetting("latest_json_url"), API.CLIENT_CONFIG_FALLBACK_URL):
+            if not url:
+                continue
+            utils.crunchy_log(f"Loading client config from: {url}")
+            try:
+                resp = self.http.get(url, timeout=10)
+                if resp.ok:
+                    cfg = resp.json()
+                    break
+                utils.crunchy_log(f"Failed to load client config: HTTP {resp.status_code}")
+            except Exception as e:
+                utils.crunchy_log(f"Error loading client config: {e}")
+
         try:
-            resp = self.http.get(latest_url, timeout=10)
-            if resp.ok:
-                cfg = resp.json()
+            if cfg:
                 utils.crunchy_log("Successfully loaded client configuration")
                 
                 # Load Android TV configuration
@@ -352,8 +363,6 @@ class API:
                         utils.crunchy_log("Parsed Android TV device client credentials")
                     except (ValueError, Exception) as e:
                         utils.crunchy_log(f"Failed to parse device credentials: {e}")
-            else:
-                utils.crunchy_log(f"Failed to load client config: HTTP {resp.status_code}")
         except Exception as e:
             utils.crunchy_log(f"Error loading client config: {e}")
 

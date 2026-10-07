@@ -1,3 +1,7 @@
+v3.6.8 (2026.10.07)
+- Fallback client config url, used when the configured one (pastes.sh) is down
+- Drop the dead reroll.is-cool.dev default
+
 v3.6.7 (2026.09.20)
 - Reload the episode at the same position on resume once its 6h DRM license
   expires (the license cannot be renewed)

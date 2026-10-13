@@ -26,9 +26,9 @@
                 </setting>
                 <setting id="latest_json_url" type="string" label="30300" help="">
                     <level>0</level>
-                    <default>https://crunchyaddon.pastes.sh/raw/paste</default>
+                    <default></default>
                     <constraints>
-                        <allowempty>false</allowempty>
+                        <allowempty>true</allowempty>
                     </constraints>
                     <control type="edit" format="string">
                         <heading>30300</heading>

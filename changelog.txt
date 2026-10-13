@@ -1,3 +1,6 @@
+v3.6.9 (2026.10.13)
+- Client config now served from snips.sh unless a custom url is set, pastes.sh dropped
+
 v3.6.8 (2026.10.07)
 - Fallback client config url, used when the configured one (pastes.sh) is down
 - Drop the dead reroll.is-cool.dev default
